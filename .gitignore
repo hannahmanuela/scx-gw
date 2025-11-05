@@ -1,0 +1,16 @@
+*
+
+!*/
+
+!.gitignore
+
+# Unignore all with extensions
+!*.c
+!*.h
+!*.md
+!*.cpp
+!*.sh
+!*.py
+!*.png
+!**/out/**
+!Makefile

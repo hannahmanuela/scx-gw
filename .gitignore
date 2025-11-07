@@ -14,3 +14,9 @@
 !*.png
 !**/out/**
 !Makefile
+
+include/**
+libbpf/**
+
+**.skel.h
+vmlinux.h

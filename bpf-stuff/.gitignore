@@ -1,9 +1,0 @@
-
-
-include/**
-libbpf/**
-
-**.skel.h
-vmlinux.h
-
-

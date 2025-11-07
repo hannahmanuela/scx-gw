@@ -177,18 +177,10 @@ void runBusyAndReport(const std::string &label) {
 
 }
 
-#define SCHED_GLOBAL_WEIGHT 4
-
 int main() {
     // Set up signal handler for cleanup
     signal(SIGINT, cleanupAndExit);
     signal(SIGTERM, cleanupAndExit);
-
-    struct sched_param sp = { .sched_priority = 0 };
-    if (sched_setscheduler(0, SCHED_GLOBAL_WEIGHT, &sp) == -1) {
-        perror("sched_setscheduler");
-        return 1;
-    }
     
     // Parent will create two children; both children will run indefinitely
     pid_t childLow = fork();

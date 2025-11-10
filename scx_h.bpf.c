@@ -159,9 +159,10 @@ void BPF_STRUCT_OPS(h_enqueue, struct task_struct *p, u64 enq_flags)
         curr_min = 0;
     }
     if (bpf_get_smp_processor_id() == 4) { 
-        bpf_printk("ENQ: p=%d, new_vrt=%llu, curr_min=%lld, nr_threads=%lu, weight=%llu", p->pid,  vt_account_existing + (u64)curr_min, curr_min, gi->num_threads, gi->weight);
+        bpf_printk("ENQ: p=%d, new_vrt=%llu, curr_min=%lld, threads_queued=%lu, weight=%llu", p->pid,  vt_account_existing + (u64)curr_min, curr_min, gi->threads_queued, gi->weight);
     }
     p->scx.dsq_vtime = vt_account_existing + (u64)curr_min;
+    p->scx.slice = MY_SLICE;
 
     // TODO: if it is less than the min, find a cpu running something with less weight to kick
 
@@ -189,7 +190,7 @@ void BPF_STRUCT_OPS(h_quiescent, struct task_struct *p, u64 deq_flags)
         gi->num_threads--;
     } else {
         if (bpf_get_smp_processor_id() == 4) { 
-            bpf_printk("ERROR: threads_queued is 0 but now task %d is blocking cgrp %d\n", p->pid, cgrp->kn->id);
+            bpf_printk("ERROR: num_threads is 0 but now task %d is blocking cgrp %d\n", p->pid, cgrp->kn->id);
         }
     }
     
@@ -251,17 +252,22 @@ void BPF_STRUCT_OPS(h_dispatch, s32 cpu, struct task_struct *prev)
     if (bpf_get_smp_processor_id() == 4) {
         bpf_printk("PICK: prev=%d, prev_vrt=%lld, nr_queued=%d (id=%d)", prev ? prev->pid : -1, prev ? prev->scx.dsq_vtime : -1, scx_bpf_dsq_nr_queued(dsq_id), dsq_id);
     }
-    if (prev) {
+    if (prev && (prev->scx.flags & SCX_TASK_QUEUED)) { // have a previous, and it is on the rq
+        s64 prev_time_used = MY_SLICE - prev->scx.slice;
+        u64 prev_task_vtime = prev->scx.dsq_vtime + signed_div(prev_time_used, prev->scx.weight); // TODO: using task weight here, not group weight. wld need to set
+
+
         struct min_dsq_info min_heap;
         pick_min_heap(~(0ULL), &min_heap);
         if (min_heap.id < 0) {
             return;
         }
-        if (prev->scx.dsq_vtime < min_heap.vtime) {
+        if (prev_task_vtime < min_heap.vtime) {
             if (bpf_get_smp_processor_id() == 4) {  
-                bpf_printk("  prev was better: prev=%d, vt=%llu", prev->pid, prev->scx.dsq_vtime);
+                bpf_printk("  prev was better: prev=%d, flags=%x (queud: %d), saved_vt=%llu, weight=%lu, time_used=%llu, full_vtime=%llu", prev->pid, prev->scx.flags, prev->scx.flags & SCX_TASK_QUEUED, prev->scx.dsq_vtime, prev->scx.weight, prev_time_used, prev_task_vtime);
             }
-            scx_bpf_dsq_insert_vtime(prev, SCX_DSQ_LOCAL, MY_SLICE, prev->scx.dsq_vtime, SCX_ENQ_REENQ);
+            prev->scx.dsq_vtime = prev_task_vtime;
+            // I guess I don't need to manually reset the slice? TODO: rn it's not scheduling often enough anyway, I need to look into that
             return;
         }
         scx_bpf_dsq_move_to_local(min_heap.id);
@@ -303,10 +309,10 @@ void BPF_STRUCT_OPS(h_stopping, struct task_struct *p, bool runnable)
     s64 time_used = MY_SLICE - p->scx.slice; // time left is kept in p->scx.slice
     p->scx.dsq_vtime += signed_div(time_used, gi->weight);
     if (bpf_get_smp_processor_id() == 4) { 
-        bpf_printk("STOP: p=%d, time_used=%lld, weight=%llu, vtime_diff=%llu, new_vtime=%llu", p->pid, time_used, gi->weight, signed_div(time_used, gi->weight), p->scx.dsq_vtime);
+        bpf_printk("STOP: p=%d, time_used=%lld, weight=%llu, vtime_diff=%lld, new_vtime=%llu", p->pid, time_used, gi->weight, signed_div(time_used, gi->weight), p->scx.dsq_vtime);
     }
 
-    // u32 dsq_id = bpf_get_prandom_u32() % NUM_HEAPS;
+    u32 dsq_id = bpf_get_prandom_u32() % NUM_HEAPS;
     // scx_bpf_dsq_insert_vtime(p, dsq_id, MY_SLICE, p->scx.dsq_vtime, enq_flags);
     bpf_cgroup_release(cgrp);
 }
@@ -327,7 +333,12 @@ void BPF_STRUCT_OPS(h_running, struct task_struct *p)
         return;
     }
 
-    gi->threads_queued -= 1;
+    // if (gi->threads_queued == 0) {
+    //     bpf_printk("ERROR: dec threads_queued in running, but already 0");
+    // } else {
+    //     gi->threads_queued -= 1;
+    // }
+    
     if (bpf_get_smp_processor_id() == 4) { 
         bpf_printk("RUN: p=%d", p->pid);
     }

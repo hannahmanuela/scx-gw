@@ -35,6 +35,13 @@ struct {
     __type(value, struct cgroup_info);
 } cgroup_info SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, u32);
+	__type(value, s64);
+	__uint(max_entries, NUM_HEAPS);
+} heap_min_vrt SEC(".maps");
+
 // =======================================================
 // HELPER FUNCTIONS
 // =======================================================
@@ -58,12 +65,50 @@ static s64 signed_div(s64 a, s64 b) {
     return aneg != bneg ? -out : out; 
 }
 
+static inline u64 min(u64 a, u64 b)
+{
+	s64 delta = (s64)(b - a);
+	if (delta < 0)
+		a = b;
+	return a;
+}
+
 /* Helper functions for active groups management */
 
 static struct cgroup_info *get_cgroup_info(struct cgroup *cgrp)
 {
     return bpf_cgrp_storage_get(&cgroup_info, cgrp, 0, 0);
 }
+
+static s64 get_heap_min_vrt(u64 dsq_id)
+{
+    s64 *min_vrt = bpf_map_lookup_elem(&heap_min_vrt, &dsq_id);
+    return min_vrt ? *min_vrt : 0;
+}
+
+static void set_heap_min_vrt(u64 dsq_id, s64 min_vrt)
+{
+    bpf_map_update_elem(&heap_min_vrt, &dsq_id, &min_vrt, BPF_ANY);
+}
+
+static void update_min_vruntime(u64 dsq_id, s64 new_vrt)
+{
+    u64 curr_min = scx_bpf_dsq_peek_head_vtime(dsq_id);
+    if (curr_min < 0) {
+        // if new_vrt is -1 too, that's fine
+        set_heap_min_vrt(dsq_id, new_vrt);
+        return;
+    }
+
+    if (new_vrt < 0) {
+        set_heap_min_vrt(dsq_id, curr_min);
+        return;
+    } else {
+        set_heap_min_vrt(dsq_id, min(curr_min, new_vrt));
+    }
+
+}
+
 
 // =======================================================
 // BPF OPS
@@ -115,6 +160,7 @@ void BPF_STRUCT_OPS(h_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
     gi->weight = weight;
 }
 
+// it looks like, p gets queiesced before but not enqed after?
 void BPF_STRUCT_OPS(h_cgroup_move, struct task_struct *p, struct cgroup *from, struct cgroup *to)
 {
     struct cgroup_info *from_gi, *to_gi;
@@ -125,10 +171,29 @@ void BPF_STRUCT_OPS(h_cgroup_move, struct task_struct *p, struct cgroup *from, s
         return;
     }
 
-    // TODO: check if the thread has to be de-qed/re-enqed anyway
-    //  if yes, the below is incorrect, or if we also need a way to re-weight this p
     from_gi->num_threads -= 1;
     to_gi->num_threads += 1;
+
+    u64 vt_account_existing = (MY_SLICE / to_gi->weight) * to_gi->threads_queued;
+
+    to_gi->threads_queued++;
+    
+    // pick a random dsq
+    // peek it's min
+    u32 dsq_id = bpf_get_prandom_u32() % NUM_HEAPS;
+    s64 curr_min = get_heap_min_vrt(dsq_id);
+    if (curr_min < 0) {
+        curr_min = 0;
+    }
+    p->scx.dsq_vtime = vt_account_existing + (u64)curr_min;
+    // p->scx.slice = MY_SLICE;
+
+    if (bpf_get_smp_processor_id() == 4) {
+        bpf_printk("CGRP_MV: %d from weight %lu to %lu; new vtime: %llu", p->pid, from_gi->weight, to_gi->weight, p->scx.dsq_vtime);
+    }
+
+
+    // scx_bpf_dsq_insert_vtime(p, dsq_id, MY_SLICE, p->scx.dsq_vtime, 0);
 }
 
 void BPF_STRUCT_OPS(h_enqueue, struct task_struct *p, u64 enq_flags)
@@ -154,7 +219,7 @@ void BPF_STRUCT_OPS(h_enqueue, struct task_struct *p, u64 enq_flags)
     // pick a random dsq
     // peek it's min
     u32 dsq_id = bpf_get_prandom_u32() % NUM_HEAPS;
-    s64 curr_min = scx_bpf_dsq_peek_head_vtime(dsq_id);
+    s64 curr_min = get_heap_min_vrt(dsq_id);
     if (curr_min < 0) {
         curr_min = 0;
     }
@@ -195,18 +260,13 @@ void BPF_STRUCT_OPS(h_quiescent, struct task_struct *p, u64 deq_flags)
     }
     
 
-    // hmmm we don't know what heap it was on
-    // TODO: FOR NOW just pick a random heap and use its min
-    u32 dsq_id = bpf_get_prandom_u32() % NUM_HEAPS;
-    s64 curr_min = scx_bpf_dsq_peek_head_vtime(dsq_id);
+    // TODO: HACK HARDCODED THE DSQ ID
+    s64 curr_min = get_heap_min_vrt(0);
     if (curr_min < 0) {
         curr_min = 0;
     }
-    // this check is needed because p is not on the dsq
-    if (curr_min > p->scx.dsq_vtime) {
-        curr_min = p->scx.dsq_vtime;
-    }
     p->scx.dsq_vtime -= curr_min;
+    update_min_vruntime(0, -1);
     if (bpf_get_smp_processor_id() == 4) { 
         bpf_printk("QUIESC: p=%d, curr_min=%llu, lag_vtime=%llu", p->pid, curr_min, p->scx.dsq_vtime);
     }
@@ -252,21 +312,26 @@ void BPF_STRUCT_OPS(h_dispatch, s32 cpu, struct task_struct *prev)
     if (bpf_get_smp_processor_id() == 4) {
         bpf_printk("PICK: prev=%d, prev_vrt=%lld, nr_queued=%d (id=%d)", prev ? prev->pid : -1, prev ? prev->scx.dsq_vtime : -1, scx_bpf_dsq_nr_queued(dsq_id), dsq_id);
     }
+
+    struct min_dsq_info min_heap;
+    pick_min_heap(~(0ULL), &min_heap);
+
+    // there is nothing on the q, keep running prev if possible (is automatic), else we have nothing to run
+    if (min_heap.id < 0) {
+        return;
+    }
+
     if (prev && (prev->scx.flags & SCX_TASK_QUEUED)) { // have a previous, and it is on the rq
         s64 prev_time_used = MY_SLICE - prev->scx.slice;
-        u64 prev_task_vtime = prev->scx.dsq_vtime + signed_div(prev_time_used, prev->scx.weight); // TODO: using task weight here, not group weight. wld need to set
+        u64 prev_task_vtime = prev->scx.dsq_vtime + signed_div(prev_time_used, prev->scx.weight);
 
-
-        struct min_dsq_info min_heap;
-        pick_min_heap(~(0ULL), &min_heap);
-        if (min_heap.id < 0) {
-            return;
-        }
         if (prev_task_vtime < min_heap.vtime) {
             if (bpf_get_smp_processor_id() == 4) {  
                 bpf_printk("  prev was better: prev=%d, flags=%x (queud: %d), saved_vt=%llu, weight=%lu, time_used=%llu, full_vtime=%llu", prev->pid, prev->scx.flags, prev->scx.flags & SCX_TASK_QUEUED, prev->scx.dsq_vtime, prev->scx.weight, prev_time_used, prev_task_vtime);
             }
             prev->scx.dsq_vtime = prev_task_vtime;
+            // TODO: THIS IS A HACK, HARD-CODED HEAP ID
+            set_heap_min_vrt(0, min(prev->scx.dsq_vtime, min_heap.vtime)); // this is ok - the vtime returned from pick min if of the QUEUED tasks, not the heap
             // I guess I don't need to manually reset the slice? TODO: rn it's not scheduling often enough anyway, I need to look into that
             return;
         }
@@ -278,8 +343,7 @@ void BPF_STRUCT_OPS(h_dispatch, s32 cpu, struct task_struct *prev)
         bpf_printk(" no prev");
     }
     // no previous thing
-    struct min_dsq_info min_heap;
-    pick_min_heap(~(0ULL), &min_heap);
+    
     
     if (min_heap.id < 0) {
         // go idle
@@ -312,8 +376,8 @@ void BPF_STRUCT_OPS(h_stopping, struct task_struct *p, bool runnable)
         bpf_printk("STOP: p=%d, time_used=%lld, weight=%llu, vtime_diff=%lld, new_vtime=%llu", p->pid, time_used, gi->weight, signed_div(time_used, gi->weight), p->scx.dsq_vtime);
     }
 
-    u32 dsq_id = bpf_get_prandom_u32() % NUM_HEAPS;
-    // scx_bpf_dsq_insert_vtime(p, dsq_id, MY_SLICE, p->scx.dsq_vtime, enq_flags);
+    // at this point p is not on the heap, but followed by enq or quiesc
+
     bpf_cgroup_release(cgrp);
 }
 
@@ -333,11 +397,6 @@ void BPF_STRUCT_OPS(h_running, struct task_struct *p)
         return;
     }
 
-    // if (gi->threads_queued == 0) {
-    //     bpf_printk("ERROR: dec threads_queued in running, but already 0");
-    // } else {
-    //     gi->threads_queued -= 1;
-    // }
     
     if (bpf_get_smp_processor_id() == 4) { 
         bpf_printk("RUN: p=%d", p->pid);
@@ -351,6 +410,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(h_init)
     // No explicit initialization needed for array maps
     for (int i=0; i < NUM_HEAPS; i++) {
         scx_bpf_create_dsq(i, -1);
+        set_heap_min_vrt(i, -1);
     }
     return 0;
 }

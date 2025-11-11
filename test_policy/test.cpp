@@ -195,7 +195,7 @@ int main() {
             std::cerr << "PID=" << getpid() << ": failed to create low_weight cgroup.\n";
             return 1;
         }
-        if (!setCgroupWeight("low_weight", 1)) {
+        if (!setCgroupWeight("low_weight", 50)) {
             std::cerr << "PID=" << getpid() << ": failed to set cgroup weight to 1.\n";
             return 1;
         }
@@ -203,6 +203,7 @@ int main() {
             std::cerr << "PID=" << getpid() << ": failed to add process to low_weight cgroup.\n";
             return 1;
         }
+        usleep(500);
 
         runBusyAndReport("idle");
         return 0;
@@ -220,7 +221,7 @@ int main() {
             std::cerr << "PID=" << getpid() << ": failed to create high_weight cgroup.\n";
             return 1;
         }
-        if (!setCgroupWeight("high_weight", 100)) {
+        if (!setCgroupWeight("high_weight", 50)) {
             std::cerr << "PID=" << getpid() << ": failed to set cgroup weight to 100.\n";
             return 1;
         }
@@ -228,6 +229,8 @@ int main() {
             std::cerr << "PID=" << getpid() << ": failed to add process to high_weight cgroup.\n";
             return 1;
         }
+
+        usleep(500);
         
         runBusyAndReport("normal");
         return 0;

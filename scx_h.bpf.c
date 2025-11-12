@@ -18,7 +18,6 @@ UEI_DEFINE(uei);
 struct cgroup_info {
 
     u32 group_id;          // group id
-    u32 num_threads;       // total number of threads in group
     u32 threads_queued;    // number of runnable but waiting threads
     u32 weight;            // group weight
 };
@@ -41,6 +40,13 @@ struct {
 	__type(value, s64);
 	__uint(max_entries, NUM_HEAPS);
 } heap_min_vrt SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__type(key, int);
+	__type(value, u64);
+} task_grp_weight SEC(".maps");
 
 // =======================================================
 // HELPER FUNCTIONS
@@ -83,17 +89,23 @@ static struct cgroup_info *get_cgroup_info(struct cgroup *cgrp)
 static s64 get_heap_min_vrt(u64 dsq_id)
 {
     s64 *min_vrt = bpf_map_lookup_elem(&heap_min_vrt, &dsq_id);
-    return min_vrt ? *min_vrt : 0;
+    return min_vrt ? *min_vrt : -1;
 }
 
 static void set_heap_min_vrt(u64 dsq_id, s64 min_vrt)
 {
+    if (bpf_get_smp_processor_id() == 4) { 
+        bpf_printk(" SET MIN_VRT: new min = %lld", min_vrt);
+    }
     bpf_map_update_elem(&heap_min_vrt, &dsq_id, &min_vrt, BPF_ANY);
 }
 
 static void update_min_vruntime(u64 dsq_id, s64 new_vrt)
 {
-    u64 curr_min = scx_bpf_dsq_peek_head_vtime(dsq_id);
+    s64 curr_min = get_heap_min_vrt(dsq_id);
+    if (bpf_get_smp_processor_id() == 4) { 
+        bpf_printk("UPD MIN_VRT: was %lld, new_vrt=%lld", curr_min, new_vrt);
+    }
     if (curr_min < 0) {
         // if new_vrt is -1 too, that's fine
         set_heap_min_vrt(dsq_id, new_vrt);
@@ -124,9 +136,12 @@ s32 BPF_STRUCT_OPS(h_init_task, struct task_struct *p, struct scx_init_task_args
     if (!gi)
         return -1;
     
-    gi->threads_queued += 1;
-    gi->num_threads += 1;
+    u64 *task_weight = bpf_task_storage_get(&task_grp_weight, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
+    if (!task_weight)
+		return -ENOMEM;
+	*task_weight = gi->weight;
     
+    // gi->threads_queued += 1;
     return 0;
 }
 
@@ -141,12 +156,12 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(h_cgroup_init, struct cgroup *cgrp, struct scx_cgro
     // everything else is initialized to 0
     gi->group_id = cgrp->kn->id;
     gi->weight = args->weight == 0 ? 1 : args->weight;
-    gi->num_threads = 0;
     gi->threads_queued = 0;
     
     return 0;
 }
 
+// TODO: this is a re-weight? We don't know what to do here yet
 void BPF_STRUCT_OPS(h_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
 {
     struct cgroup_info *gi;
@@ -156,7 +171,6 @@ void BPF_STRUCT_OPS(h_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
         return;
     }
 
-    // TODO: this is a re-weight? We don't know what to do here yet
     gi->weight = weight;
 }
 
@@ -171,12 +185,16 @@ void BPF_STRUCT_OPS(h_cgroup_move, struct task_struct *p, struct cgroup *from, s
         return;
     }
 
-    from_gi->num_threads -= 1;
-    to_gi->num_threads += 1;
+    // u64 vt_account_existing = (MY_SLICE / to_gi->weight) * to_gi->threads_queued;
+    u64 vt_account_existing = 0;
 
-    u64 vt_account_existing = (MY_SLICE / to_gi->weight) * to_gi->threads_queued;
-
-    to_gi->threads_queued++;
+    // already quiesced on old group
+    // to_gi->threads_queued++;
+    
+    u64 *task_weight = bpf_task_storage_get(&task_grp_weight, p, 0, 0);
+    if (!task_weight) 
+        return;
+    *task_weight = to_gi->weight;
     
     // pick a random dsq
     // peek it's min
@@ -196,7 +214,7 @@ void BPF_STRUCT_OPS(h_cgroup_move, struct task_struct *p, struct cgroup *from, s
     // scx_bpf_dsq_insert_vtime(p, dsq_id, MY_SLICE, p->scx.dsq_vtime, 0);
 }
 
-void BPF_STRUCT_OPS(h_enqueue, struct task_struct *p, u64 enq_flags)
+void BPF_STRUCT_OPS(h_runnable, struct task_struct *p, u64 enq_flags)
 {
     struct cgroup_info *gi;
     struct cgroup *cgrp = scx_bpf_task_cgroup(p);
@@ -212,9 +230,10 @@ void BPF_STRUCT_OPS(h_enqueue, struct task_struct *p, u64 enq_flags)
         return;
     }
         
-    u64 vt_account_existing = (MY_SLICE / gi->weight) * gi->threads_queued;
+    // u64 vt_account_existing = (MY_SLICE / gi->weight) * gi->threads_queued;
+    u64 vt_account_existing = 0;
     
-    gi->threads_queued++;
+    // gi->threads_queued++;
     
     // pick a random dsq
     // peek it's min
@@ -224,16 +243,25 @@ void BPF_STRUCT_OPS(h_enqueue, struct task_struct *p, u64 enq_flags)
         curr_min = 0;
     }
     if (bpf_get_smp_processor_id() == 4) { 
-        bpf_printk("ENQ: p=%d, new_vrt=%llu, curr_min=%lld, threads_queued=%lu, weight=%llu", p->pid,  vt_account_existing + (u64)curr_min, curr_min, gi->threads_queued, gi->weight);
-    }
-    p->scx.dsq_vtime = vt_account_existing + (u64)curr_min;
+        bpf_printk("RUNNABLE: p=%d, old_vrt=%llu, new_vrt=%llu, curr_min=%lld, threads_queued=%lu, weight=%llu", p->pid, p->scx.dsq_vtime, p->scx.dsq_vtime + vt_account_existing + (u64)curr_min, curr_min, gi->threads_queued, gi->weight);
+    };
+    p->scx.dsq_vtime += vt_account_existing + (u64)curr_min; // kept lag, now adding back "slot" + min
     p->scx.slice = MY_SLICE;
 
-    // TODO: if it is less than the min, find a cpu running something with less weight to kick
+    update_min_vruntime(0, p->scx.dsq_vtime);
 
-    scx_bpf_dsq_insert_vtime(p, dsq_id, MY_SLICE, p->scx.dsq_vtime, enq_flags);
+    // TODO: if it is less than the min (is that ever the case??), find a cpu running something with less weight to kick
     
     bpf_cgroup_release(cgrp);
+}
+
+void BPF_STRUCT_OPS(h_enqueue, struct task_struct *p, u64 enq_flags)
+{
+    u32 dsq_id = bpf_get_prandom_u32() % NUM_HEAPS;
+    if (bpf_get_smp_processor_id() == 4) { 
+        bpf_printk("ENQ: p=%d, vrt=%llu", p->pid, p->scx.dsq_vtime);
+    };
+    scx_bpf_dsq_insert_vtime(p, dsq_id, MY_SLICE, p->scx.dsq_vtime, enq_flags);
 }
 
 void BPF_STRUCT_OPS(h_quiescent, struct task_struct *p, u64 deq_flags)
@@ -249,27 +277,21 @@ void BPF_STRUCT_OPS(h_quiescent, struct task_struct *p, u64 deq_flags)
         bpf_cgroup_release(cgrp);
         return;
     }
-    
-    // Update group queued count
-    if (gi->num_threads > 0) {
-        gi->num_threads--;
-    } else {
-        if (bpf_get_smp_processor_id() == 4) { 
-            bpf_printk("ERROR: num_threads is 0 but now task %d is blocking cgrp %d\n", p->pid, cgrp->kn->id);
-        }
-    }
-    
 
-    // TODO: HACK HARDCODED THE DSQ ID
+    // TODO: HACK HARDCODED THE DSQ ID [add this to per-task storage?]
     s64 curr_min = get_heap_min_vrt(0);
     if (curr_min < 0) {
         curr_min = 0;
     }
+    if (curr_min > p->scx.dsq_vtime) {
+        curr_min = p->scx.dsq_vtime;
+    }
     p->scx.dsq_vtime -= curr_min;
-    update_min_vruntime(0, -1);
     if (bpf_get_smp_processor_id() == 4) { 
         bpf_printk("QUIESC: p=%d, curr_min=%llu, lag_vtime=%llu", p->pid, curr_min, p->scx.dsq_vtime);
     }
+    update_min_vruntime(0, -1);
+    
     bpf_cgroup_release(cgrp);
 }
 
@@ -318,18 +340,23 @@ void BPF_STRUCT_OPS(h_dispatch, s32 cpu, struct task_struct *prev)
 
     // there is nothing on the q, keep running prev if possible (is automatic), else we have nothing to run
     if (min_heap.id < 0) {
+        scx_bpf_dsq_move_to_local(0); // ??
         return;
     }
 
     if (prev && (prev->scx.flags & SCX_TASK_QUEUED)) { // have a previous, and it is on the rq
         s64 prev_time_used = MY_SLICE - prev->scx.slice;
-        u64 prev_task_vtime = prev->scx.dsq_vtime + signed_div(prev_time_used, prev->scx.weight);
+        u64 *task_weight = bpf_task_storage_get(&task_grp_weight, prev, 0, 0);
+        if (!task_weight) 
+            return;
+        u64 prev_task_vtime = prev->scx.dsq_vtime + signed_div(prev_time_used, *task_weight);
 
-        if (prev_task_vtime < min_heap.vtime) {
+        if (prev_task_vtime <= min_heap.vtime) {
             if (bpf_get_smp_processor_id() == 4) {  
-                bpf_printk("  prev was better: prev=%d, flags=%x (queud: %d), saved_vt=%llu, weight=%lu, time_used=%llu, full_vtime=%llu", prev->pid, prev->scx.flags, prev->scx.flags & SCX_TASK_QUEUED, prev->scx.dsq_vtime, prev->scx.weight, prev_time_used, prev_task_vtime);
+                bpf_printk("  prev was better: prev=%d, flags=%x (queud: %d), saved_vt=%llu, weight=%lu, time_used=%llu, full_vtime=%llu", prev->pid, prev->scx.flags, prev->scx.flags & SCX_TASK_QUEUED, prev->scx.dsq_vtime, *task_weight, prev_time_used, prev_task_vtime);
             }
             prev->scx.dsq_vtime = prev_task_vtime;
+            prev->scx.slice = MY_SLICE;
             // TODO: THIS IS A HACK, HARD-CODED HEAP ID
             set_heap_min_vrt(0, min(prev->scx.dsq_vtime, min_heap.vtime)); // this is ok - the vtime returned from pick min if of the QUEUED tasks, not the heap
             // I guess I don't need to manually reset the slice? TODO: rn it's not scheduling often enough anyway, I need to look into that
@@ -371,10 +398,25 @@ void BPF_STRUCT_OPS(h_stopping, struct task_struct *p, bool runnable)
     }
     
     s64 time_used = MY_SLICE - p->scx.slice; // time left is kept in p->scx.slice
-    p->scx.dsq_vtime += signed_div(time_used, gi->weight);
-    if (bpf_get_smp_processor_id() == 4) { 
-        bpf_printk("STOP: p=%d, time_used=%lld, weight=%llu, vtime_diff=%lld, new_vtime=%llu", p->pid, time_used, gi->weight, signed_div(time_used, gi->weight), p->scx.dsq_vtime);
+    if (time_used > 0) {
+        p->scx.dsq_vtime += signed_div(time_used, gi->weight);
     }
+    if (bpf_get_smp_processor_id() == 4) { 
+        bpf_printk("STOP: p=%d, flags=%llx, time_used=%lld, weight=%llu, vtime_diff=%lld, new_vtime=%llu", p->pid, p->scx.flags, time_used, gi->weight, signed_div(time_used, gi->weight), p->scx.dsq_vtime);
+    }
+
+    // s64 curr_min = get_heap_min_vrt(0);
+    // if (curr_min < 0) {
+    //     curr_min = 0;
+    // }
+    // if (curr_min > p->scx.dsq_vtime) {
+    //     curr_min = p->scx.dsq_vtime;
+    // }
+    // p->scx.dsq_vtime -= curr_min;
+    // if (bpf_get_smp_processor_id() == 4) { 
+    //     bpf_printk("STOP2: p=%d, curr_min=%llu, lag_vtime=%llu", p->pid, curr_min, p->scx.dsq_vtime);
+    // }
+    // update_min_vruntime(0, -1);
 
     // at this point p is not on the heap, but followed by enq or quiesc
 
@@ -397,11 +439,24 @@ void BPF_STRUCT_OPS(h_running, struct task_struct *p)
         return;
     }
 
+    // TODO: problem: this doesn't take into account that p might just be a re-run (we can get cycles of pick->run [...] pick->run)
+    // if (gi->threads_queued > 0) {
+    //     gi->threads_queued--;
+    // } else {
+    //     if (bpf_get_smp_processor_id() == 4) { 
+    //         bpf_printk("ERROR: threads_queued is 0 but now task %d is running cgrp %d\n", p->pid, cgrp->kn->id);
+    //     }
+    // }
     
     if (bpf_get_smp_processor_id() == 4) { 
         bpf_printk("RUN: p=%d", p->pid);
     }
     bpf_cgroup_release(cgrp);
+}
+
+void BPF_STRUCT_OPS(h_tick, struct task_struct *p)
+{
+    p->scx.slice = 0;
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(h_init)
@@ -422,20 +477,17 @@ void BPF_STRUCT_OPS(h_exit, struct scx_exit_info *ei)
 
 SCX_OPS_DEFINE(h_ops,
         .init_task		= (void *)h_init_task,
-        // .select_cpu		= (void *)h_select_cpu,
-        .enqueue		= (void *)h_enqueue,
-        // .runnable		= (void *)h_runnable,
+        .runnable		= (void *)h_runnable,
+        .enqueue        = (void *)h_enqueue,
         .dispatch		= (void *)h_dispatch,
         .running		= (void *)h_running,
         .stopping		= (void *)h_stopping,
         .quiescent		= (void *)h_quiescent,
-        // .exit_task		= (void *)h_exit_task,
-        // .enable			= (void *)h_enable,
-        // .disable		= (void *)h_disable,
+        .tick               = (void *)h_tick,
         .cgroup_init		= (void *)h_cgroup_init,
         .cgroup_set_weight	= (void *)h_cgroup_set_weight,
         .cgroup_move		= (void *)h_cgroup_move,
         .init			= (void *)h_init,
         .exit			= (void *)h_exit,
-        .flags			= SCX_OPS_HAS_CGROUP_WEIGHT | SCX_OPS_ENQ_EXITING,
+        .flags			= SCX_OPS_HAS_CGROUP_WEIGHT | SCX_OPS_ENQ_EXITING | SCX_OPS_SWITCH_PARTIAL,
         .name			= "h");

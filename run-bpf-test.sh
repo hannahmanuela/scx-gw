@@ -29,7 +29,7 @@ sleep 4
 
 kill -9 $bpf_pid
 
-Kill the entire process tree
+# Kill the entire process tree
 pkill -TERM -P $pid
 kill -TERM $pid
 sleep 1

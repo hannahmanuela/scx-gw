@@ -21,6 +21,9 @@
 
 #define CPU_NUM 4
 
+// copied over
+#define SCHED_EXT 7
+
 namespace {
 
 bool setAffinityToCpu(int cpuIndex) {
@@ -181,6 +184,9 @@ int main() {
     // Set up signal handler for cleanup
     signal(SIGINT, cleanupAndExit);
     signal(SIGTERM, cleanupAndExit);
+
+    struct sched_param *param;
+    sched_setscheduler(0, SCHED_EXT, param);
     
     // Parent will create two children; both children will run indefinitely
     pid_t childLow = fork();

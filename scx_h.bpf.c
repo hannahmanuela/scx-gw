@@ -204,14 +204,11 @@ void BPF_STRUCT_OPS(h_cgroup_move, struct task_struct *p, struct cgroup *from, s
         curr_min = 0;
     }
     p->scx.dsq_vtime = vt_account_existing + (u64)curr_min;
-    // p->scx.slice = MY_SLICE;
 
     if (bpf_get_smp_processor_id() == 4) {
         bpf_printk("CGRP_MV: %d from weight %lu to %lu; new vtime: %llu", p->pid, from_gi->weight, to_gi->weight, p->scx.dsq_vtime);
     }
 
-
-    // scx_bpf_dsq_insert_vtime(p, dsq_id, MY_SLICE, p->scx.dsq_vtime, 0);
 }
 
 void BPF_STRUCT_OPS(h_runnable, struct task_struct *p, u64 enq_flags)
@@ -340,7 +337,6 @@ void BPF_STRUCT_OPS(h_dispatch, s32 cpu, struct task_struct *prev)
 
     // there is nothing on the q, keep running prev if possible (is automatic), else we have nothing to run
     if (min_heap.id < 0) {
-        scx_bpf_dsq_move_to_local(0); // ??
         return;
     }
 
@@ -359,7 +355,6 @@ void BPF_STRUCT_OPS(h_dispatch, s32 cpu, struct task_struct *prev)
             prev->scx.slice = MY_SLICE;
             // TODO: THIS IS A HACK, HARD-CODED HEAP ID
             set_heap_min_vrt(0, min(prev->scx.dsq_vtime, min_heap.vtime)); // this is ok - the vtime returned from pick min if of the QUEUED tasks, not the heap
-            // I guess I don't need to manually reset the slice? TODO: rn it's not scheduling often enough anyway, I need to look into that
             return;
         }
         scx_bpf_dsq_move_to_local(min_heap.id);
@@ -405,21 +400,6 @@ void BPF_STRUCT_OPS(h_stopping, struct task_struct *p, bool runnable)
         bpf_printk("STOP: p=%d, flags=%llx, time_used=%lld, weight=%llu, vtime_diff=%lld, new_vtime=%llu", p->pid, p->scx.flags, time_used, gi->weight, signed_div(time_used, gi->weight), p->scx.dsq_vtime);
     }
 
-    // s64 curr_min = get_heap_min_vrt(0);
-    // if (curr_min < 0) {
-    //     curr_min = 0;
-    // }
-    // if (curr_min > p->scx.dsq_vtime) {
-    //     curr_min = p->scx.dsq_vtime;
-    // }
-    // p->scx.dsq_vtime -= curr_min;
-    // if (bpf_get_smp_processor_id() == 4) { 
-    //     bpf_printk("STOP2: p=%d, curr_min=%llu, lag_vtime=%llu", p->pid, curr_min, p->scx.dsq_vtime);
-    // }
-    // update_min_vruntime(0, -1);
-
-    // at this point p is not on the heap, but followed by enq or quiesc
-
     bpf_cgroup_release(cgrp);
 }
 
@@ -449,20 +429,19 @@ void BPF_STRUCT_OPS(h_running, struct task_struct *p)
     // }
     
     if (bpf_get_smp_processor_id() == 4) { 
-        bpf_printk("RUN: p=%d", p->pid);
+        bpf_printk("RUN: p=%d, slice=%llu", p->pid, p->scx.slice);
     }
     bpf_cgroup_release(cgrp);
 }
 
 void BPF_STRUCT_OPS(h_tick, struct task_struct *p)
 {
-    p->scx.slice = 0;
+    bpf_printk("TICK: %d, slice=%llu", p->pid, p->scx.slice);
+    // p->scx.slice = 0;
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(h_init)
 {
-    // Initialize active groups map (all entries start as 0)
-    // No explicit initialization needed for array maps
     for (int i=0; i < NUM_HEAPS; i++) {
         scx_bpf_create_dsq(i, -1);
         set_heap_min_vrt(i, -1);

@@ -135,6 +135,12 @@ static void update_min_vruntime(u64 dsq_id, s64 new_vrt)
 
 }
 
+void set_cpu_running_weight(u64 new_weight)
+{
+    u64 zero = 0;
+    bpf_map_update_elem(&cpu_curr_weight, &zero, &new_weight, 0);
+}
+
 static s32 get_cpu_running_min_weight(u64 new_weight, const struct cpumask *task_cpumask)
 {
     u64 zero = 0;
@@ -475,6 +481,8 @@ void BPF_STRUCT_OPS(h_running, struct task_struct *p)
     //         bpf_printk("ERROR: threads_queued is 0 but now task %d is running cgrp %d\n", p->pid, cgrp->kn->id);
     //     }
     // }
+
+    set_cpu_running_weight(gi->weight);
     
     if (want_to_print()) { 
         bpf_printk("RUN: p=%d, slice=%llu", p->pid, p->scx.slice);

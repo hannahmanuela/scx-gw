@@ -22,6 +22,11 @@ struct cgroup_info {
     u32 weight;            // group weight
 };
 
+struct task_info {
+    u32 grp_weight;
+    int on_rq;
+};
+
 // =======================================================
 // MAPS
 // =======================================================
@@ -45,7 +50,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 	__type(key, int);
-	__type(value, u64);
+	__type(value, struct task_info);
 } task_grp_weight SEC(".maps");
 
 struct {
@@ -63,6 +68,7 @@ static bool want_to_print()
 {
     return false;
     // return bpf_get_smp_processor_id() == 2 || bpf_get_smp_processor_id() == 4;
+    // return bpf_get_smp_processor_id() == 4;
 }
 
 
@@ -165,6 +171,48 @@ static s32 get_cpu_running_min_weight(u64 new_weight, const struct cpumask *task
     
 }
 
+static void set_task_weight(struct task_struct *p, u32 new_weight)
+{
+    struct task_info *task_info = bpf_task_storage_get(&task_grp_weight, p, 0, 0);
+    if (!task_info)
+        return;
+    task_info->grp_weight = new_weight;
+}
+
+static void set_task_on_rq(struct task_struct *p, int on_rq)
+{
+    struct task_info *task_info = bpf_task_storage_get(&task_grp_weight, p, 0, 0);
+    if (!task_info)
+        return;
+    task_info->on_rq = on_rq;
+}
+
+static int init_task_info(struct task_struct *p, struct cgroup_info *gi)
+{
+    struct task_info *task_info = bpf_task_storage_get(&task_grp_weight, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
+    if (!task_info)
+        return -ENOMEM;
+    task_info->grp_weight = gi->weight;
+    task_info->on_rq = 0;
+    return 0;
+}
+
+static u32 get_task_weight(struct task_struct *p)
+{
+    struct task_info *task_info = bpf_task_storage_get(&task_grp_weight, p, 0, 0);
+    if (!task_info)
+        return 0;
+    return task_info->grp_weight;
+}
+
+static int get_task_on_rq(struct task_struct *p)
+{
+    struct task_info *task_info = bpf_task_storage_get(&task_grp_weight, p, 0, 0);
+    if (!task_info)
+        return -1;
+    return task_info->on_rq;
+}
+
 
 // =======================================================
 // BPF OPS
@@ -180,13 +228,7 @@ s32 BPF_STRUCT_OPS(h_init_task, struct task_struct *p, struct scx_init_task_args
     if (!gi)
         return -1;
     
-    u64 *task_weight = bpf_task_storage_get(&task_grp_weight, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
-    if (!task_weight)
-		return -ENOMEM;
-	*task_weight = gi->weight;
-    
-    // gi->threads_queued += 1;
-    return 0;
+    return init_task_info(p, gi);
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(h_cgroup_init, struct cgroup *cgrp, struct scx_cgroup_init_args *args)
@@ -229,16 +271,10 @@ void BPF_STRUCT_OPS(h_cgroup_move, struct task_struct *p, struct cgroup *from, s
         return;
     }
 
-    // u64 vt_account_existing = (MY_SLICE / to_gi->weight) * to_gi->threads_queued;
-    u64 vt_account_existing = 0;
-
-    // already quiesced on old group
-    // to_gi->threads_queued++;
+    u64 vt_account_existing = (MY_SLICE / to_gi->weight) * to_gi->threads_queued;
+    // u64 vt_account_existing = 0;
     
-    u64 *task_weight = bpf_task_storage_get(&task_grp_weight, p, 0, 0);
-    if (!task_weight) 
-        return;
-    *task_weight = to_gi->weight;
+    set_task_weight(p, to_gi->weight);
     
     // pick a random dsq
     // peek it's min
@@ -271,11 +307,9 @@ void BPF_STRUCT_OPS(h_runnable, struct task_struct *p, u64 enq_flags)
         return;
     }
         
-    // u64 vt_account_existing = (MY_SLICE / gi->weight) * gi->threads_queued;
-    u64 vt_account_existing = 0;
-    
-    // gi->threads_queued++;
-    
+    u64 vt_account_existing = (MY_SLICE / gi->weight) * gi->threads_queued;
+    // u64 vt_account_existing = 0;
+        
     // pick a random dsq
     // peek it's min
     u32 dsq_id = bpf_get_prandom_u32() % NUM_HEAPS;
@@ -293,7 +327,7 @@ void BPF_STRUCT_OPS(h_runnable, struct task_struct *p, u64 enq_flags)
 
     // pick a core to kick, if there is one running something with less weight
     s32 core_to_kick = get_cpu_running_min_weight(gi->weight, p->cpus_ptr);
-    if (core_to_kick > 0 && core_to_kick != bpf_get_smp_processor_id()) {
+    if (core_to_kick > 0) {
         if (want_to_print()) {
             bpf_printk("KICKING CPU: %d", core_to_kick);
         }
@@ -305,11 +339,31 @@ void BPF_STRUCT_OPS(h_runnable, struct task_struct *p, u64 enq_flags)
 
 void BPF_STRUCT_OPS(h_enqueue, struct task_struct *p, u64 enq_flags)
 {
+    struct cgroup_info *gi;
+    struct cgroup *cgrp = scx_bpf_task_cgroup(p);
+    if (!cgrp) {
+        if (cgrp) bpf_cgroup_release(cgrp);
+        return;
+    }
+    gi = get_cgroup_info(cgrp);
+    if (!gi) {
+        bpf_cgroup_release(cgrp);
+        return;
+    }
+
     u32 dsq_id = bpf_get_prandom_u32() % NUM_HEAPS;
     if (want_to_print()) { 
         bpf_printk("ENQ: p=%d, vrt=%llu", p->pid, p->scx.dsq_vtime);
     };
+
+    gi->threads_queued++;
+    if (want_to_print()) { 
+        bpf_printk("TQ INC: p=%d, now %lu\n", p->pid, gi->threads_queued);
+    }
+    set_task_on_rq(p, 1);
     scx_bpf_dsq_insert_vtime(p, dsq_id, MY_SLICE, p->scx.dsq_vtime, enq_flags);
+
+    bpf_cgroup_release(cgrp);
 }
 
 void BPF_STRUCT_OPS(h_quiescent, struct task_struct *p, u64 deq_flags)
@@ -474,13 +528,13 @@ void BPF_STRUCT_OPS(h_running, struct task_struct *p)
     }
 
     // TODO: problem: this doesn't take into account that p might just be a re-run (we can get cycles of pick->run [...] pick->run)
-    // if (gi->threads_queued > 0) {
-    //     gi->threads_queued--;
-    // } else {
-    //     if (bpf_get_smp_processor_id() == 4) { 
-    //         bpf_printk("ERROR: threads_queued is 0 but now task %d is running cgrp %d\n", p->pid, cgrp->kn->id);
-    //     }
-    // }
+    if (get_task_on_rq(p)) {
+        gi->threads_queued--;
+        set_task_on_rq(p, 0);
+        if (want_to_print()) { 
+            bpf_printk("TQ DEC: p=%d, now %lu\n", p->pid, gi->threads_queued);
+        }
+    }
 
     set_cpu_running_weight(gi->weight);
     

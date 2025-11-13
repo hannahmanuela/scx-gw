@@ -52,6 +52,12 @@ struct {
 // HELPER FUNCTIONS
 // =======================================================
 
+static bool want_to_print()
+{
+    return bpf_get_smp_processor_id() == 2 || bpf_get_smp_processor_id() == 4;
+}
+
+
 static __always_inline __u64 safe_div_u64(__u64 a, __u64 b)
 {
     if (b == 0)
@@ -94,7 +100,7 @@ static s64 get_heap_min_vrt(u64 dsq_id)
 
 static void set_heap_min_vrt(u64 dsq_id, s64 min_vrt)
 {
-    if (bpf_get_smp_processor_id() == 4) { 
+    if (want_to_print()) { 
         bpf_printk(" SET MIN_VRT: new min = %lld", min_vrt);
     }
     bpf_map_update_elem(&heap_min_vrt, &dsq_id, &min_vrt, BPF_ANY);
@@ -103,7 +109,7 @@ static void set_heap_min_vrt(u64 dsq_id, s64 min_vrt)
 static void update_min_vruntime(u64 dsq_id, s64 new_vrt)
 {
     s64 curr_min = get_heap_min_vrt(dsq_id);
-    if (bpf_get_smp_processor_id() == 4) { 
+    if (want_to_print()) { 
         bpf_printk("UPD MIN_VRT: was %lld, new_vrt=%lld", curr_min, new_vrt);
     }
     if (curr_min < 0) {
@@ -205,7 +211,7 @@ void BPF_STRUCT_OPS(h_cgroup_move, struct task_struct *p, struct cgroup *from, s
     }
     p->scx.dsq_vtime = vt_account_existing + (u64)curr_min;
 
-    if (bpf_get_smp_processor_id() == 4) {
+    if (want_to_print()) { 
         bpf_printk("CGRP_MV: %d from weight %lu to %lu; new vtime: %llu", p->pid, from_gi->weight, to_gi->weight, p->scx.dsq_vtime);
     }
 
@@ -239,7 +245,7 @@ void BPF_STRUCT_OPS(h_runnable, struct task_struct *p, u64 enq_flags)
     if (curr_min < 0) {
         curr_min = 0;
     }
-    if (bpf_get_smp_processor_id() == 4) { 
+    if (want_to_print()) { 
         bpf_printk("RUNNABLE: p=%d, old_vrt=%llu, new_vrt=%llu, curr_min=%lld, threads_queued=%lu, weight=%llu", p->pid, p->scx.dsq_vtime, p->scx.dsq_vtime + vt_account_existing + (u64)curr_min, curr_min, gi->threads_queued, gi->weight);
     };
     p->scx.dsq_vtime += vt_account_existing + (u64)curr_min; // kept lag, now adding back "slot" + min
@@ -255,7 +261,7 @@ void BPF_STRUCT_OPS(h_runnable, struct task_struct *p, u64 enq_flags)
 void BPF_STRUCT_OPS(h_enqueue, struct task_struct *p, u64 enq_flags)
 {
     u32 dsq_id = bpf_get_prandom_u32() % NUM_HEAPS;
-    if (bpf_get_smp_processor_id() == 4) { 
+    if (want_to_print()) { 
         bpf_printk("ENQ: p=%d, vrt=%llu", p->pid, p->scx.dsq_vtime);
     };
     scx_bpf_dsq_insert_vtime(p, dsq_id, MY_SLICE, p->scx.dsq_vtime, enq_flags);
@@ -284,7 +290,7 @@ void BPF_STRUCT_OPS(h_quiescent, struct task_struct *p, u64 deq_flags)
         curr_min = p->scx.dsq_vtime;
     }
     p->scx.dsq_vtime -= curr_min;
-    if (bpf_get_smp_processor_id() == 4) { 
+    if (want_to_print()) { 
         bpf_printk("QUIESC: p=%d, curr_min=%llu, lag_vtime=%llu", p->pid, curr_min, p->scx.dsq_vtime);
     }
     update_min_vruntime(0, -1);
@@ -312,7 +318,7 @@ static void pick_min_heap(u64 prev_vtime, struct min_dsq_info *result) {
         
         // Check if this group has the minimum spec_virt_time
         if (heap_min < curr_min_vt) {
-            if (bpf_get_smp_processor_id() == 4) {
+            if (want_to_print()) { 
                 bpf_printk("PICK: min_heap=%d, nr_queued=%ld, vrt=%llu", dsq_id, scx_bpf_dsq_nr_queued(dsq_id), heap_min);
             }
             curr_min_heap = dsq_id;
@@ -328,7 +334,7 @@ static void pick_min_heap(u64 prev_vtime, struct min_dsq_info *result) {
 void BPF_STRUCT_OPS(h_dispatch, s32 cpu, struct task_struct *prev)
 {
     u64 dsq_id = 0;
-    if (bpf_get_smp_processor_id() == 4) {
+    if (want_to_print()) { 
         bpf_printk("PICK: prev=%d, prev_vrt=%lld, nr_queued=%d (id=%d)", prev ? prev->pid : -1, prev ? prev->scx.dsq_vtime : -1, scx_bpf_dsq_nr_queued(dsq_id), dsq_id);
     }
 
@@ -348,7 +354,7 @@ void BPF_STRUCT_OPS(h_dispatch, s32 cpu, struct task_struct *prev)
         u64 prev_task_vtime = prev->scx.dsq_vtime + signed_div(prev_time_used, *task_weight);
 
         if (prev_task_vtime <= min_heap.vtime) {
-            if (bpf_get_smp_processor_id() == 4) {  
+            if (want_to_print()) { 
                 bpf_printk("  prev was better: prev=%d, flags=%x (queud: %d), saved_vt=%llu, weight=%lu, time_used=%llu, full_vtime=%llu", prev->pid, prev->scx.flags, prev->scx.flags & SCX_TASK_QUEUED, prev->scx.dsq_vtime, *task_weight, prev_time_used, prev_task_vtime);
             }
             prev->scx.dsq_vtime = prev_task_vtime;
@@ -396,7 +402,7 @@ void BPF_STRUCT_OPS(h_stopping, struct task_struct *p, bool runnable)
     if (time_used > 0) {
         p->scx.dsq_vtime += signed_div(time_used, gi->weight);
     }
-    if (bpf_get_smp_processor_id() == 4) { 
+    if (want_to_print()) { 
         bpf_printk("STOP: p=%d, flags=%llx, time_used=%lld, weight=%llu, vtime_diff=%lld, new_vtime=%llu", p->pid, p->scx.flags, time_used, gi->weight, signed_div(time_used, gi->weight), p->scx.dsq_vtime);
     }
 
@@ -428,7 +434,7 @@ void BPF_STRUCT_OPS(h_running, struct task_struct *p)
     //     }
     // }
     
-    if (bpf_get_smp_processor_id() == 4) { 
+    if (want_to_print()) { 
         bpf_printk("RUN: p=%d, slice=%llu", p->pid, p->scx.slice);
     }
     bpf_cgroup_release(cgrp);
@@ -436,8 +442,10 @@ void BPF_STRUCT_OPS(h_running, struct task_struct *p)
 
 void BPF_STRUCT_OPS(h_tick, struct task_struct *p)
 {
-    bpf_printk("TICK: %d, slice=%llu", p->pid, p->scx.slice);
-    // p->scx.slice = 0;
+    if (want_to_print()) { 
+        bpf_printk("TICK: %d, slice=%llu", p->pid, p->scx.slice);
+    }
+    p->scx.slice = 0;
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(h_init)

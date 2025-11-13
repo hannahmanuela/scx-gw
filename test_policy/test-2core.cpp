@@ -7,6 +7,8 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <vector>
+#include <pthread.h>
 #include <unistd.h>
 #include <sys/resource.h>
 #include <sys/types.h>
@@ -19,19 +21,35 @@
 #include <fstream>
 #include <errno.h>
 
-#define CPU_NUM 4
 
 // copied over
 #define SCHED_EXT 7
 
 namespace {
 
-bool setAffinityToCpu(int cpuIndex) {
+const std::vector<int> kAllowedCpus = {2, 4};
+
+bool setAffinityToCpus(const std::vector<int>& cpuIndices) {
     cpu_set_t set;
     CPU_ZERO(&set);
-    CPU_SET(cpuIndex, &set);
+    for (int cpuIndex : cpuIndices) {
+        CPU_SET(cpuIndex, &set);
+    }
     if (sched_setaffinity(0, sizeof(set), &set) != 0) {
         std::perror("sched_setaffinity");
+        return false;
+    }
+    return true;
+}
+
+bool setThreadAffinityToCpus(pthread_t thread, const std::vector<int>& cpuIndices) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (int cpuIndex : cpuIndices) {
+        CPU_SET(cpuIndex, &set);
+    }
+    if (pthread_setaffinity_np(thread, sizeof(set), &set) != 0) {
+        std::perror("pthread_setaffinity_np");
         return false;
     }
     return true;
@@ -110,10 +128,10 @@ struct CpuAndWall {
     double wallSec;
 };
 
-CpuAndWall sampleCpuAndWall() {
+CpuAndWall sampleCpuAndWall(clockid_t cpuClockId = CLOCK_THREAD_CPUTIME_ID) {
     timespec cpuTs{};
     timespec wallTs{};
-    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpuTs);
+    clock_gettime(cpuClockId, &cpuTs);
     clock_gettime(CLOCK_MONOTONIC, &wallTs);
     return {timespecToSec(cpuTs), timespecToSec(wallTs)};
 }
@@ -185,7 +203,10 @@ int main() {
     signal(SIGINT, cleanupAndExit);
     signal(SIGTERM, cleanupAndExit);
 
-    setAffinityToCpu(CPU_NUM);
+    if (!setAffinityToCpus(kAllowedCpus)) {
+        std::cerr << "Parent: failed to set CPU affinity.\n";
+        return 1;
+    }
 
     struct sched_param param;
     param.sched_priority = 0;
@@ -202,6 +223,10 @@ int main() {
     }
 
     if (childLow == 0) {
+        if (!setAffinityToCpus(kAllowedCpus)) {
+            std::cerr << "PID=" << getpid() << ": failed to set CPU affinity.\n";
+            return 1;
+        }
         // Low weight: cgroup with weight 1
         if (!createCgroup("low_weight")) {
             std::cerr << "PID=" << getpid() << ": failed to create low_weight cgroup.\n";
@@ -228,6 +253,10 @@ int main() {
     }
 
     if (childHigh == 0) {
+        if (!setAffinityToCpus(kAllowedCpus)) {
+            std::cerr << "PID=" << getpid() << ": failed to set CPU affinity.\n";
+            return 1;
+        }
         // High weight: cgroup with weight 100
         if (!createCgroup("high_weight")) {
             std::cerr << "PID=" << getpid() << ": failed to create high_weight cgroup.\n";
@@ -244,7 +273,18 @@ int main() {
 
         // usleep(500);
         
-        runBusyAndReport("normal");
+        std::vector<std::thread> workers;
+        workers.reserve(2);
+        for (int i = 0; i < 2; ++i) {
+            std::string label = "normal-" + std::to_string(i);
+            workers.emplace_back([label]() {
+                runBusyAndReport(label);
+            });
+        }
+        for (auto& worker : workers) {
+            worker.join();
+        }
+
         return 0;
     }
 
@@ -256,7 +296,14 @@ int main() {
     // setAffinityToCpu(CPU_NUM);
 
     std::cout << "Spawned children PIDs: low=" << childLow << ", high=" << childHigh
-              << ". Both pinned to CPU " << CPU_NUM << ". Press Ctrl+C to stop.\n";
+              << ". Both pinned to CPUs {";
+    for (size_t i = 0; i < kAllowedCpus.size(); ++i) {
+        std::cout << kAllowedCpus[i];
+        if (i + 1 != kAllowedCpus.size()) {
+            std::cout << ", ";
+        }
+    }
+    std::cout << "}. Press Ctrl+C to stop.\n";
     std::cout.flush();
 
     // Wait forever (children run until killed)

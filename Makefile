@@ -32,6 +32,7 @@ $(USER_BIN): $(USER_SRC) $(BPF_SKEL_HDR)
 
 test:
 	g++ -std=c++17 -o test_policy/test test_policy/test.cpp
+	g++ -std=c++17 -o test_policy/test-2core test_policy/test-2core.cpp
 
 clean:
 	rm -f $(BPFELF) $(BPF_SKEL_HDR) $(USER_BIN)

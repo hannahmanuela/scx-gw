@@ -48,13 +48,21 @@ struct {
 	__type(value, u64);
 } task_grp_weight SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, int);
+	__type(value, u64);
+    __uint(max_entries, 1);
+} cpu_curr_weight SEC(".maps");
+
 // =======================================================
 // HELPER FUNCTIONS
 // =======================================================
 
 static bool want_to_print()
 {
-    return bpf_get_smp_processor_id() == 2 || bpf_get_smp_processor_id() == 4;
+    return false;
+    // return bpf_get_smp_processor_id() == 2 || bpf_get_smp_processor_id() == 4;
 }
 
 
@@ -125,6 +133,30 @@ static void update_min_vruntime(u64 dsq_id, s64 new_vrt)
         set_heap_min_vrt(dsq_id, min(curr_min, new_vrt));
     }
 
+}
+
+static s32 get_cpu_running_min_weight(u64 new_weight, const struct cpumask *task_cpumask)
+{
+    u64 zero = 0;
+    u64 min_weight = new_weight;
+
+    s32 cpu_w_min_weight = -1;
+
+    int i = 0;
+    u32 nr_cpu_ids = scx_bpf_nr_cpu_ids();
+    u64 *cpu_weight;
+    bpf_for(i, 0, nr_cpu_ids) {
+        if (!bpf_cpumask_test_cpu(i, task_cpumask)) {
+            continue;
+        }
+        cpu_weight = bpf_map_lookup_percpu_elem(&cpu_curr_weight, &zero, i);
+        if (cpu_weight && *cpu_weight < min_weight) {
+            cpu_w_min_weight = i;
+        }
+    }
+
+    return cpu_w_min_weight;
+    
 }
 
 
@@ -251,9 +283,16 @@ void BPF_STRUCT_OPS(h_runnable, struct task_struct *p, u64 enq_flags)
     p->scx.dsq_vtime += vt_account_existing + (u64)curr_min; // kept lag, now adding back "slot" + min
     p->scx.slice = MY_SLICE;
 
-    update_min_vruntime(0, p->scx.dsq_vtime);
+    update_min_vruntime(dsq_id, p->scx.dsq_vtime);
 
-    // TODO: if it is less than the min (is that ever the case??), find a cpu running something with less weight to kick
+    // pick a core to kick, if there is one running something with less weight
+    s32 core_to_kick = get_cpu_running_min_weight(gi->weight, p->cpus_ptr);
+    if (core_to_kick > 0 && core_to_kick != bpf_get_smp_processor_id()) {
+        if (want_to_print()) {
+            bpf_printk("KICKING CPU: %d", core_to_kick);
+        }
+        scx_bpf_kick_cpu((u32)core_to_kick, SCX_KICK_PREEMPT);
+    }
     
     bpf_cgroup_release(cgrp);
 }
@@ -338,6 +377,9 @@ void BPF_STRUCT_OPS(h_dispatch, s32 cpu, struct task_struct *prev)
         bpf_printk("PICK: prev=%d, prev_vrt=%lld, nr_queued=%d (id=%d)", prev ? prev->pid : -1, prev ? prev->scx.dsq_vtime : -1, scx_bpf_dsq_nr_queued(dsq_id), dsq_id);
     }
 
+    // TODO: pretty sure this is racy - we aren't locking it and so two threads can do this in lockstep
+    // I could also implement a conditional move_to_local that fails if the head is not what we expected....
+    // for now not a problem since we only have one heap
     struct min_dsq_info min_heap;
     pick_min_heap(~(0ULL), &min_heap);
 

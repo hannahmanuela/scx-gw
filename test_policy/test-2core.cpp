@@ -183,7 +183,7 @@ void runBusyAndReport(const std::string &label) {
 
         if (dWall >= 1.0) {
             double pct = (dCpu / dWall) * 100.0;
-            std::cout << "PID=" << getpid() << " [" << label << "] CPU="
+            std::cout << "PID=" << getpid() << ", TID " << gettid() << " [" << label << "] CPU="
                       << pct << "% over last ~" << dWall << "s\n";
             std::cout.flush();
             prev = now;
@@ -240,7 +240,7 @@ int main() {
             std::cerr << "PID=" << getpid() << ": failed to add process to low_weight cgroup.\n";
             return 1;
         }
-        // usleep(500);
+        usleep(500);
 
         runBusyAndReport("idle");
         return 0;
@@ -262,7 +262,7 @@ int main() {
             std::cerr << "PID=" << getpid() << ": failed to create high_weight cgroup.\n";
             return 1;
         }
-        if (!setCgroupWeight("high_weight", 1000)) {
+        if (!setCgroupWeight("high_weight", 100)) {
             std::cerr << "PID=" << getpid() << ": failed to set cgroup weight to 100.\n";
             return 1;
         }
@@ -271,11 +271,11 @@ int main() {
             return 1;
         }
 
-        // usleep(500);
+        usleep(500);
         
         std::vector<std::thread> workers;
-        workers.reserve(2);
-        for (int i = 0; i < 2; ++i) {
+        workers.reserve(4);
+        for (int i = 0; i < 4; ++i) {
             std::string label = "normal-" + std::to_string(i);
             workers.emplace_back([label]() {
                 runBusyAndReport(label);

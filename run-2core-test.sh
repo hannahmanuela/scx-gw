@@ -22,7 +22,7 @@ sleep 0.5
 # PID_TRACE=$!
 
 
-taskset -c 4 ./test_policy/test-2core &
+./test_policy/test-2core &
 pid=$!
 
 sleep 4

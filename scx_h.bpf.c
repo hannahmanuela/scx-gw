@@ -23,7 +23,7 @@ struct cgroup_info {
 };
 
 struct task_info {
-    u32 grp_weight;
+    u64 cgid;
     int on_rq;
 };
 
@@ -37,7 +37,7 @@ struct {
     __uint(map_flags, BPF_F_NO_PREALLOC);
     __type(key, int);
     __type(value, struct cgroup_info);
-} cgroup_info SEC(".maps");
+} cgroup_info_map SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -51,7 +51,7 @@ struct {
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 	__type(key, int);
 	__type(value, struct task_info);
-} task_grp_weight SEC(".maps");
+} task_info_map SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -66,8 +66,8 @@ struct {
 
 static bool want_to_print()
 {
-    return false;
-    // return bpf_get_smp_processor_id() == 2 || bpf_get_smp_processor_id() == 4;
+    // return false;
+    return bpf_get_smp_processor_id() == 2 || bpf_get_smp_processor_id() == 4;
     // return bpf_get_smp_processor_id() == 4;
 }
 
@@ -103,7 +103,7 @@ static inline u64 min(u64 a, u64 b)
 
 static struct cgroup_info *get_cgroup_info(struct cgroup *cgrp)
 {
-    return bpf_cgrp_storage_get(&cgroup_info, cgrp, 0, 0);
+    return bpf_cgrp_storage_get(&cgroup_info_map, cgrp, 0, 0);
 }
 
 static s64 get_heap_min_vrt(u64 dsq_id)
@@ -171,46 +171,19 @@ static s32 get_cpu_running_min_weight(u64 new_weight, const struct cpumask *task
     
 }
 
-static void set_task_weight(struct task_struct *p, u32 new_weight)
-{
-    struct task_info *task_info = bpf_task_storage_get(&task_grp_weight, p, 0, 0);
-    if (!task_info)
-        return;
-    task_info->grp_weight = new_weight;
-}
-
-static void set_task_on_rq(struct task_struct *p, int on_rq)
-{
-    struct task_info *task_info = bpf_task_storage_get(&task_grp_weight, p, 0, 0);
-    if (!task_info)
-        return;
-    task_info->on_rq = on_rq;
-}
-
 static int init_task_info(struct task_struct *p, struct cgroup_info *gi)
 {
-    struct task_info *task_info = bpf_task_storage_get(&task_grp_weight, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
+    struct task_info *task_info = bpf_task_storage_get(&task_info_map, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
     if (!task_info)
         return -ENOMEM;
-    task_info->grp_weight = gi->weight;
+    task_info->cgid = gi->group_id;
     task_info->on_rq = 0;
     return 0;
 }
 
-static u32 get_task_weight(struct task_struct *p)
+static struct task_info *get_task_info(struct task_struct *p)
 {
-    struct task_info *task_info = bpf_task_storage_get(&task_grp_weight, p, 0, 0);
-    if (!task_info)
-        return 0;
-    return task_info->grp_weight;
-}
-
-static int get_task_on_rq(struct task_struct *p)
-{
-    struct task_info *task_info = bpf_task_storage_get(&task_grp_weight, p, 0, 0);
-    if (!task_info)
-        return -1;
-    return task_info->on_rq;
+    return bpf_task_storage_get(&task_info_map, p, 0, 0);
 }
 
 
@@ -235,7 +208,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(h_cgroup_init, struct cgroup *cgrp, struct scx_cgro
 {
     struct cgroup_info *gi;
     
-    gi = bpf_cgrp_storage_get(&cgroup_info, cgrp, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
+    gi = bpf_cgrp_storage_get(&cgroup_info_map, cgrp, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
     if (!gi)
         return -ENOMEM;
     
@@ -274,7 +247,8 @@ void BPF_STRUCT_OPS(h_cgroup_move, struct task_struct *p, struct cgroup *from, s
     u64 vt_account_existing = (MY_SLICE / to_gi->weight) * to_gi->threads_queued;
     // u64 vt_account_existing = 0;
     
-    set_task_weight(p, to_gi->weight);
+    struct task_info *ti = get_task_info(p);
+    if (ti) ti->cgid = to_gi->group_id;
     
     // pick a random dsq
     // peek it's min
@@ -356,11 +330,12 @@ void BPF_STRUCT_OPS(h_enqueue, struct task_struct *p, u64 enq_flags)
         bpf_printk("ENQ: p=%d, vrt=%llu", p->pid, p->scx.dsq_vtime);
     };
 
-    gi->threads_queued++;
+    u32 new_threads_qd = __sync_add_and_fetch(&gi->threads_queued, 1);
     if (want_to_print()) { 
-        bpf_printk("TQ INC: p=%d, now %lu\n", p->pid, gi->threads_queued);
+        bpf_printk("TQ INC: p=%d, now %lu", p->pid, new_threads_qd);
     }
-    set_task_on_rq(p, 1);
+    struct task_info *ti = get_task_info(p);
+    if (ti) ti->on_rq = 1;
     scx_bpf_dsq_insert_vtime(p, dsq_id, MY_SLICE, p->scx.dsq_vtime, enq_flags);
 
     bpf_cgroup_release(cgrp);
@@ -449,26 +424,48 @@ void BPF_STRUCT_OPS(h_dispatch, s32 cpu, struct task_struct *prev)
     }
 
     if (prev && (prev->scx.flags & SCX_TASK_QUEUED)) { // have a previous, and it is on the rq
+
+        struct task_info *prev_i = get_task_info(prev);
+        if (!prev_i) 
+            goto no_prev;
+
+        struct cgroup_info *prev_grp;
+        struct cgroup *cgrp = bpf_cgroup_from_id(prev_i->cgid);
+        if (!cgrp) {
+            if (cgrp) bpf_cgroup_release(cgrp);
+            goto no_prev;
+        }
+        prev_grp = get_cgroup_info(cgrp);
+        if (!prev_grp) {
+            bpf_cgroup_release(cgrp);
+            goto no_prev;
+        }
+
         s64 prev_time_used = MY_SLICE - prev->scx.slice;
-        u64 *task_weight = bpf_task_storage_get(&task_grp_weight, prev, 0, 0);
-        if (!task_weight) 
-            return;
-        u64 prev_task_vtime = prev->scx.dsq_vtime + signed_div(prev_time_used, *task_weight);
+        
+        u64 vt_account_existing = (MY_SLICE / prev_grp->weight) * prev_grp->threads_queued;
+        u64 prev_task_vtime = vt_account_existing + prev->scx.dsq_vtime + signed_div(prev_time_used, prev_grp->weight);
+        bpf_cgroup_release(cgrp);
 
         if (prev_task_vtime <= min_heap.vtime) {
             if (want_to_print()) { 
-                bpf_printk("  prev was better: prev=%d, flags=%x (queud: %d), saved_vt=%llu, weight=%lu, time_used=%llu, full_vtime=%llu", prev->pid, prev->scx.flags, prev->scx.flags & SCX_TASK_QUEUED, prev->scx.dsq_vtime, *task_weight, prev_time_used, prev_task_vtime);
+                bpf_printk("  prev was better: prev=%d, saved_vt=%llu, weight=%lu, time_used=%llu, account_exiting=%llu, full_vtime=%llu", prev->pid, prev->scx.dsq_vtime, prev_grp->weight, prev_time_used, vt_account_existing, prev_task_vtime);
             }
             prev->scx.dsq_vtime = prev_task_vtime;
             prev->scx.slice = MY_SLICE;
             // TODO: THIS IS A HACK, HARD-CODED HEAP ID
             set_heap_min_vrt(0, min(prev->scx.dsq_vtime, min_heap.vtime)); // this is ok - the vtime returned from pick min if of the QUEUED tasks, not the heap
             return;
+        } else {
+            if (want_to_print()) { 
+                bpf_printk("  prev was worse: prev=%d, saved_vt=%llu, weight=%lu, time_used=%llu, account_exiting=%llu, full_vtime=%llu", prev->pid, prev->scx.dsq_vtime, prev_grp->weight, prev_time_used, vt_account_existing, prev_task_vtime);
+            }
         }
         scx_bpf_dsq_move_to_local(min_heap.id);
         return;
     }
 
+no_prev:
     if (bpf_get_smp_processor_id() == 4) {
         bpf_printk(" no prev");
     }
@@ -501,11 +498,12 @@ void BPF_STRUCT_OPS(h_stopping, struct task_struct *p, bool runnable)
     }
     
     s64 time_used = MY_SLICE - p->scx.slice; // time left is kept in p->scx.slice
+    u64 vt_account_existing = (MY_SLICE / gi->weight) * gi->threads_queued;
     if (time_used > 0) {
-        p->scx.dsq_vtime += signed_div(time_used, gi->weight);
+        p->scx.dsq_vtime += vt_account_existing + signed_div(time_used, gi->weight);
     }
     if (want_to_print()) { 
-        bpf_printk("STOP: p=%d, flags=%llx, time_used=%lld, weight=%llu, vtime_diff=%lld, new_vtime=%llu", p->pid, p->scx.flags, time_used, gi->weight, signed_div(time_used, gi->weight), p->scx.dsq_vtime);
+        bpf_printk("STOP: p=%d, account_existing=%llu, time_used=%lld, weight=%llu, vtime_diff=%lld, new_vtime=%llu", p->pid, vt_account_existing, time_used, gi->weight, signed_div(time_used, gi->weight), p->scx.dsq_vtime);
     }
 
     bpf_cgroup_release(cgrp);
@@ -527,19 +525,19 @@ void BPF_STRUCT_OPS(h_running, struct task_struct *p)
         return;
     }
 
-    // TODO: problem: this doesn't take into account that p might just be a re-run (we can get cycles of pick->run [...] pick->run)
-    if (get_task_on_rq(p)) {
-        gi->threads_queued--;
-        set_task_on_rq(p, 0);
+    struct task_info *ti = get_task_info(p);
+    if (ti && ti->on_rq) {
+        u32 new_threads_qd = __sync_sub_and_fetch(&gi->threads_queued, 1);
+        ti->on_rq = 0;
         if (want_to_print()) { 
-            bpf_printk("TQ DEC: p=%d, now %lu\n", p->pid, gi->threads_queued);
+            bpf_printk("TQ DEC: p=%d, now %lu", p->pid, new_threads_qd);
         }
     }
 
     set_cpu_running_weight(gi->weight);
     
     if (want_to_print()) { 
-        bpf_printk("RUN: p=%d, slice=%llu", p->pid, p->scx.slice);
+        bpf_printk("RUN: p=%d, slice=%llu\n", p->pid, p->scx.slice);
     }
     bpf_cgroup_release(cgrp);
 }

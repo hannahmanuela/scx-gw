@@ -232,7 +232,7 @@ int main() {
             std::cerr << "PID=" << getpid() << ": failed to create low_weight cgroup.\n";
             return 1;
         }
-        if (!setCgroupWeight("low_weight", 1)) {
+        if (!setCgroupWeight("low_weight", 100)) {
             std::cerr << "PID=" << getpid() << ": failed to set cgroup weight to 1.\n";
             return 1;
         }

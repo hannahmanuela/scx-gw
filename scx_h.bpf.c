@@ -190,6 +190,8 @@ s32 BPF_STRUCT_OPS(h_init_task, struct task_struct *p, struct scx_init_task_args
     if (!gi)
         return -1;
     
+    bpf_printk("init_task: pid=%d, gid=%d, grp_w=%lu", p->pid, gi->group_id, gi->weight);
+    
     return init_task_info(p, gi);
 }
 
@@ -245,7 +247,7 @@ void BPF_STRUCT_OPS(h_cgroup_move, struct task_struct *p, struct cgroup *from, s
     
     ti->cgid = to_gi->group_id;
 
-    if (want_to_print()) bpf_printk("cgroup_move: pid=%d, new_grp=%d", p->pid, to->kn->id);
+    if (want_to_print()) bpf_printk("cgroup_move: pid=%d, new_grp=%d, new_grp_w=%lu", p->pid, to->kn->id, to_gi->weight);
 
 }
 
@@ -334,7 +336,7 @@ void BPF_STRUCT_OPS(h_enqueue, struct task_struct *p, u64 enq_flags)
 
     if (old_nt == 0) {
         u64 lag = gi->vtime - gi->min_vtime_at_sleep;
-        if (lag > curr_min) {
+        if (gi->min_vtime_at_sleep > curr_min) {
             lag += gi->min_vtime_at_sleep - curr_min;
         }
         gi->vtime = curr_min + lag;
@@ -379,7 +381,7 @@ void BPF_STRUCT_OPS(h_quiescent, struct task_struct *p, u64 deq_flags)
         gi->min_vtime_at_sleep = curr_min;
     }
 
-    if (want_to_print()) bpf_printk("quiescent: pid=%d, gid=%d, flags=%x, new_nt=%llu, min_sleep=%llu", p->pid, cgrp->kn->id, deq_flags, new_nt, gi->min_vtime_at_sleep);
+    if (want_to_print()) bpf_printk("quiescent: pid=%d, gid=%d, flags=%x, new_nt=%llu, min_sleep=%llu, saved_vt=%llu", p->pid, cgrp->kn->id, deq_flags, new_nt, gi->min_vtime_at_sleep, gi->vtime);
     
     bpf_cgroup_release(cgrp);
 }
@@ -440,16 +442,19 @@ void BPF_STRUCT_OPS(h_dispatch, s32 cpu, struct task_struct *prev)
 
         // only actually advance the time if the process is chosen to run next, otherwise "stopping" will do that for us
         s64 prev_time_used = (s64)bpf_ktime_get_ns() - (s64)prev_i->time_started_running;
-        u64 pot_new_vt = adjusted_grp_vtime(prev_gi, prev_time_used);
+
+        u64 weighted_tick = (MY_SLICE / prev_gi->weight);
+        u64 pot_new_vt = adjusted_grp_vtime(prev_gi, prev_time_used) + weighted_tick;
         
         if (pot_new_vt <= min_heap.vtime) {
-            prev_gi->vtime = pot_new_vt;
-            prev->scx.dsq_vtime = prev_gi->vtime;
             prev->scx.slice = MY_SLICE;
 
-            prev_gi->vtime += signed_div(prev_time_used, prev_gi->weight);
+            __sync_lock_test_and_set(&prev_gi->vtime, pot_new_vt);
 
-            if (want_to_print()) bpf_printk("dispatch: cpu=%ld, prev=%d, prev_queued=%d, using_prev, new_grp_vt=%llu", cpu, prev->pid, prev->scx.flags & SCX_TASK_QUEUED, prev_gi->vtime);
+            // "running" is not called again, so time_started_running is never reset; do it here instead
+            prev_i->time_started_running = bpf_ktime_get_ns();
+
+            if (want_to_print()) bpf_printk("dispatch: prev=%d, using_prev, time_used=%llu, new_grp_vt=%llu", prev->pid, prev_time_used, prev_gi->vtime);
             
             bpf_cgroup_release(cgrp);
             return;
@@ -526,7 +531,7 @@ void BPF_STRUCT_OPS(h_running, struct task_struct *p)
 
     set_cpu_running_weight(gi->weight);
 
-    if (want_to_print()) bpf_printk("running: pid=%d, gid=%d", p->pid, cgrp->kn->id);
+    if (want_to_print()) bpf_printk("running: pid=%d, gid=%d, ts=%llu", p->pid, cgrp->kn->id, ti->time_started_running);
 
     bpf_cgroup_release(cgrp);
 }

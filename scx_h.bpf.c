@@ -10,6 +10,10 @@ UEI_DEFINE(uei);
 
 #define NUM_HEAPS 1
 #define MY_SLICE ((__u64)4 * 1000000) // 4ms
+#define HWEIGHT_ONE 1LLU << 16 // copied over from flatcg
+
+// used to see if a group's hweight has been updated since the last tree change
+u64 hweight_gen = 1;
 
 // =======================================================
 // DATA STRUCTURES
@@ -18,6 +22,11 @@ UEI_DEFINE(uei);
 struct cgroup_info {
     u32 group_id;       // group id
     u32 weight;         // group weight
+
+    // used to calculate the extrapolated weight of nested cgroups
+    u32 hweight;        
+    u32 child_weight_sum;
+    u64 hweight_gen;
 
     u32 nthreads;       // total number of active threads (includes queued and running)
 
@@ -69,9 +78,9 @@ struct {
 
 static bool want_to_print()
 {
-    return false;
+    // return false;
     // return bpf_get_smp_processor_id() == 2 || bpf_get_smp_processor_id() == 4;
-    // return bpf_get_smp_processor_id() == 4;
+    return bpf_get_smp_processor_id() == 4;
     // return bpf_get_smp_processor_id() == 2 || bpf_get_smp_processor_id() == 4 || bpf_get_smp_processor_id() == 6 || bpf_get_smp_processor_id() == 8;
 }
 
@@ -93,6 +102,11 @@ static s64 signed_div(s64 a, s64 b) {
     u64 out = safe_div_u64(adiv, bdiv);
     // Make output negative if one or the other is negative, not both 
     return aneg != bneg ? -out : out; 
+}
+
+static u64 div_round_up(u64 dividend, u64 divisor)
+{
+	return (dividend + divisor - 1) / divisor;
 }
 
 static inline u64 min(u64 a, u64 b)
@@ -161,8 +175,8 @@ static u64 adjusted_grp_vtime(struct cgroup_info *gi, s64 time_passed)
     if (time_passed < 0) {
         return gi->vtime;
     }
-    u64 weighted_time_passed = signed_div(time_passed, gi->weight);
-    u64 expected = safe_div_u64(MY_SLICE, gi->weight);
+    u64 weighted_time_passed = signed_div(time_passed, gi->hweight);
+    u64 expected = safe_div_u64(MY_SLICE, gi->hweight);
     if (weighted_time_passed < expected) {
         s64 diff = (s64)expected - (s64)weighted_time_passed;
         bpf_printk("ADJ: %d og_vtime=%llu, (sub)diff=%lld", gi->group_id, gi->vtime, diff);
@@ -173,6 +187,91 @@ static u64 adjusted_grp_vtime(struct cgroup_info *gi, s64 time_passed)
         return gi->vtime + diff;
     }
     return gi->vtime;
+}
+
+static struct cgroup_info *get_ancestor_cgroup_info(struct cgroup *cgrp, int level)
+{
+	struct cgroup_info *cgi;
+
+	cgrp = bpf_cgroup_ancestor(cgrp, level);
+	if (!cgrp) {
+		scx_bpf_error("ancestor cgroup lookup failed");
+		return NULL;
+	}
+
+	cgi = get_cgroup_info(cgrp);
+	if (!cgi)
+		scx_bpf_error("ancestor cgrp_ctx lookup failed");
+	bpf_cgroup_release(cgrp);
+	return cgi;
+}
+
+// checks/updates a groups hweight
+static void refresh_cgrp_hweight(struct cgroup *cgrp, struct cgroup_info *gi) {
+
+    if (gi->hweight_gen == hweight_gen) return;
+
+    int level;
+
+	bpf_for(level, 0, cgrp->level + 1) {
+		struct cgroup_info *gi;
+		bool is_active;
+
+		gi = get_ancestor_cgroup_info(cgrp, level);
+		if (!gi)
+			break;
+
+		if (!level) {
+            // root cg
+			gi->hweight = HWEIGHT_ONE;
+		} else {
+			struct cgroup_info *par_gi;
+
+			par_gi = get_ancestor_cgroup_info(cgrp, level - 1);
+			if (!par_gi)
+				break;
+
+            gi->hweight_gen = par_gi->hweight_gen;
+            gi->hweight = div_round_up(par_gi->hweight * gi->weight,
+                            par_gi->child_weight_sum);
+
+		}
+	}
+
+}
+
+// when a group is added, propagates the weight change up the tree
+static void update_tree_weight_sums(struct cgroup *cgrp)
+{
+	struct cgroup_info *gi;
+	bool updated = false;
+	int idx;
+
+	gi = get_cgroup_info(cgrp);
+	if (!gi)
+		return;
+
+    // add the new weight to add the "child_weight_sum"s in the tree above the new group
+	bpf_for(idx, 0, cgrp->level) {
+		int level = cgrp->level - idx;
+		struct cgroup_info *gi, *par_gi = NULL;
+		bool propagate = false;
+
+		gi = get_ancestor_cgroup_info(cgrp, level);
+		if (!gi)
+			break;
+		if (level) {
+			par_gi = get_ancestor_cgroup_info(cgrp, level - 1);
+			if (!par_gi)
+				break;
+		}
+
+        if (par_gi) {
+            par_gi->child_weight_sum += gi->weight;
+        }
+	}
+
+	__sync_fetch_and_add(&hweight_gen, 1);
 }
 
 
@@ -205,30 +304,43 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(h_cgroup_init, struct cgroup *cgrp, struct scx_cgro
     
     // everything else is initialized to 0
     gi->group_id = cgrp->kn->id;
-    gi->weight = args->weight == 0 ? 1 : args->weight;
+    gi->weight = args->weight;
+    gi->hweight = HWEIGHT_ONE;
     gi->nthreads = 0;
     gi->vtime = 0;
     gi->min_vtime_at_sleep = 0;
+
+    update_tree_weight_sums(cgrp);
     
     return 0;
 }
 
-// TODO: this is a re-weight? We don't know what to do here yet, if it's currently running stuff
+
 void BPF_STRUCT_OPS(h_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
 {
-    struct cgroup_info *gi;
+    struct cgroup_info *gi, *par_gi = NULL;
     gi = get_cgroup_info(cgrp);
     if (!gi) {
         bpf_printk("ERROR: No group info for cgroup %d?", cgrp->kn->id);
         return;
     }
 
-    gi->weight = weight;
+    if (cgrp->level) {
+		par_gi = get_ancestor_cgroup_info(cgrp, cgrp->level - 1);
+		if (!par_gi)
+			return;
+	}
+
+	if (par_gi)
+		par_gi->child_weight_sum += (s64)weight - gi->weight;
+	gi->weight = weight;
+
+    __sync_fetch_and_add(&hweight_gen, 1);
+
 }
 
 // if the process was queued it got deqed before this and will be re-enqueued after, 
 //   if it was running it got put_prev before and will be set_next
-// TODO: hmm this might not call runnable? just enq? follow the control flow
 void BPF_STRUCT_OPS(h_cgroup_move, struct task_struct *p, struct cgroup *from, struct cgroup *to)
 {
     struct cgroup_info *from_gi, *to_gi;
@@ -238,6 +350,9 @@ void BPF_STRUCT_OPS(h_cgroup_move, struct task_struct *p, struct cgroup *from, s
         bpf_printk("ERROR: No group info for cgroup %d or %d?", from->kn->id, to->kn->id);
         return;
     }
+
+    // refresh so that the weight we use below is correct
+    refresh_cgrp_hweight(to, to_gi);
     
     struct task_info *ti = get_task_info(p);
     if (!ti) {
@@ -247,7 +362,7 @@ void BPF_STRUCT_OPS(h_cgroup_move, struct task_struct *p, struct cgroup *from, s
     
     ti->cgid = to_gi->group_id;
 
-    if (want_to_print()) bpf_printk("cgroup_move: pid=%d, new_grp=%d, new_grp_w=%lu", p->pid, to->kn->id, to_gi->weight);
+    if (want_to_print()) bpf_printk("cgroup_move: pid=%d, new_grp=%d, new_grp_w=%lu", p->pid, to->kn->id, to_gi->hweight);
 
 }
 
@@ -266,6 +381,9 @@ void BPF_STRUCT_OPS(h_runnable, struct task_struct *p, u64 enq_flags)
         bpf_cgroup_release(cgrp);
         return;
     }
+
+    // refresh so that the weight we use below is correct
+    refresh_cgrp_hweight(cgrp, gi);
 
     if (want_to_print()) bpf_printk("runnable: pid=%d, gid=%d, flags=%x", p->pid, cgrp->kn->id, enq_flags);
 
@@ -290,14 +408,14 @@ void BPF_STRUCT_OPS(h_runnable, struct task_struct *p, u64 enq_flags)
         p->scx.dsq_vtime = gi->vtime;
         p->scx.slice = MY_SLICE;
 
-        u64 weighted_tick = (MY_SLICE / gi->weight);
+        u64 weighted_tick = (MY_SLICE / gi->hweight);
         u64 new_grp_vt = __sync_add_and_fetch(&gi->vtime, weighted_tick);
 
-        if (want_to_print()) bpf_printk("(runnable)enqueue: pid=%d, gid=%d, flags=%x, grp_w=%llu, new_nt=%d, new_grp_vt=%llu, p_vt=%llu", p->pid, cgrp->kn->id, enq_flags, gi->weight, old_nt +1, new_grp_vt, p->scx.dsq_vtime);
+        if (want_to_print()) bpf_printk("(runnable)enqueue: pid=%d, gid=%d, flags=%x, grp_w=%llu, new_nt=%d, new_grp_vt=%llu, p_vt=%llu", p->pid, cgrp->kn->id, enq_flags, gi->hweight, old_nt +1, new_grp_vt, p->scx.dsq_vtime);
 
     }
 
-    s32 core_to_kick = get_cpu_running_min_weight(gi->weight, p->cpus_ptr);
+    s32 core_to_kick = get_cpu_running_min_weight(gi->hweight, p->cpus_ptr);
     if (core_to_kick > 0) {
         scx_bpf_kick_cpu((u32)core_to_kick, SCX_KICK_PREEMPT);
     }
@@ -318,6 +436,9 @@ void BPF_STRUCT_OPS(h_enqueue, struct task_struct *p, u64 enq_flags)
         bpf_cgroup_release(cgrp);
         return;
     }
+
+    // refresh so that the weight we use below is correct
+    refresh_cgrp_hweight(cgrp, gi);
 
     struct task_info *ti = get_task_info(p);
     if (!ti) {
@@ -345,10 +466,10 @@ void BPF_STRUCT_OPS(h_enqueue, struct task_struct *p, u64 enq_flags)
     p->scx.dsq_vtime = gi->vtime;
     p->scx.slice = MY_SLICE;
 
-    u64 weighted_tick = (MY_SLICE / gi->weight);
+    u64 weighted_tick = (MY_SLICE / gi->hweight);
     u64 new_grp_vt = __sync_add_and_fetch(&gi->vtime, weighted_tick);
     
-    if (want_to_print()) bpf_printk("enqueue: pid=%d, gid=%d, flags=%x, grp_w=%llu, new_nt=%d, new_grp_vt=%llu, p_vt=%llu", p->pid, cgrp->kn->id, enq_flags, gi->weight, old_nt +1, new_grp_vt, p->scx.dsq_vtime);
+    if (want_to_print()) bpf_printk("enqueue: pid=%d, gid=%d, flags=%x, grp_w=%llu, new_nt=%d, new_grp_vt=%llu, p_vt=%llu", p->pid, cgrp->kn->id, enq_flags, gi->hweight, old_nt +1, new_grp_vt, p->scx.dsq_vtime);
 
     scx_bpf_dsq_insert_vtime(p, dsq_id, MY_SLICE, p->scx.dsq_vtime, enq_flags);
 
@@ -440,10 +561,13 @@ void BPF_STRUCT_OPS(h_dispatch, s32 cpu, struct task_struct *prev)
             goto no_prev;
         }
 
+        // refresh so that the weight we use below is correct
+        refresh_cgrp_hweight(cgrp, prev_gi);
+
         // only actually advance the time if the process is chosen to run next, otherwise "stopping" will do that for us
         s64 prev_time_used = (s64)bpf_ktime_get_ns() - (s64)prev_i->time_started_running;
 
-        u64 weighted_tick = (MY_SLICE / prev_gi->weight);
+        u64 weighted_tick = (MY_SLICE / prev_gi->hweight);
         u64 pot_new_vt = adjusted_grp_vtime(prev_gi, prev_time_used) + weighted_tick;
         
         if (pot_new_vt <= min_heap.vtime) {
@@ -491,6 +615,9 @@ void BPF_STRUCT_OPS(h_stopping, struct task_struct *p, bool runnable)
         return;
     }
 
+    // refresh so that the weight we use below is correct
+    refresh_cgrp_hweight(cgrp, gi);
+
     if (p->scx.slice > 0) {
         // it was just interrupted by a higher order process, and will keep running anyway (see comment in put_prev_task_scx in ext.c)
         bpf_cgroup_release(cgrp);
@@ -521,6 +648,9 @@ void BPF_STRUCT_OPS(h_running, struct task_struct *p)
         return;
     }
 
+    // refresh so that the weight we use below is correct
+    refresh_cgrp_hweight(cgrp, gi);
+
     struct task_info *ti = get_task_info(p);
     if (!ti) {
         scx_bpf_error("task_ctx lookup failed");
@@ -529,7 +659,7 @@ void BPF_STRUCT_OPS(h_running, struct task_struct *p)
     }
     ti->time_started_running = bpf_ktime_get_ns();
 
-    set_cpu_running_weight(gi->weight);
+    set_cpu_running_weight(gi->hweight);
 
     if (want_to_print()) bpf_printk("running: pid=%d, gid=%d, ts=%llu", p->pid, cgrp->kn->id, ti->time_started_running);
 

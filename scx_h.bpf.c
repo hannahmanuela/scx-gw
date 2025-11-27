@@ -41,6 +41,7 @@ struct task_info {
     u64 time_started_running;
 
     bool runnable_enqed;
+    u64 ts_enqueued;
 };
 
 struct core_info {
@@ -87,12 +88,12 @@ struct {
 
 static bool want_to_print()
 {
-    return false;
+    // return false;
     // return true;
     // return bpf_get_smp_processor_id() == 2 || bpf_get_smp_processor_id() == 4;
     // return bpf_get_smp_processor_id() == 4;
     // return bpf_get_smp_processor_id() == 2 || bpf_get_smp_processor_id() == 4 || bpf_get_smp_processor_id() == 6 || bpf_get_smp_processor_id() == 8;
-    // return bpf_get_smp_processor_id() == 4 || bpf_get_smp_processor_id() == 6 || bpf_get_smp_processor_id() == 8 || bpf_get_smp_processor_id() == 10;
+    return bpf_get_smp_processor_id() == 4 || bpf_get_smp_processor_id() == 6 || bpf_get_smp_processor_id() == 8 || bpf_get_smp_processor_id() == 10;
 }
 
 
@@ -149,13 +150,50 @@ struct core_info *get_core_info(s64 core_id)
     return ci;
 }
 
-static s32 get_cpu_running_min_weight(u64 new_weight, const struct cpumask *task_cpumask)
+static s64 get_min_vtime(const struct cpumask *task_cpumask, bool print) 
+{
+    u32 own_cpu = bpf_get_smp_processor_id();
+
+    u64 dsq_id = 0;
+    s64 heap_min = scx_bpf_dsq_peek_head_vtime(dsq_id);
+
+    u64 core_min = ~(0ULL);
+
+    int i = 0;
+    u32 nr_cpu_ids = scx_bpf_nr_cpu_ids();
+    struct core_info *ci;
+    bpf_for(i, 0, nr_cpu_ids) {
+        if (!bpf_cpumask_test_cpu(i, task_cpumask) || i == own_cpu) {
+            continue;
+        }
+        ci = get_core_info(i);
+        // should be the min of the actively running processes, idle cores have nothing to do with it
+        if (ci && ci->vtime_running > 0 && ci->vtime_running < core_min) {
+            core_min = ci->vtime_running;
+        }
+    }
+
+    if (print || want_to_print()) bpf_printk("heap_min=%lld(%llu), core_min=%llu", heap_min, (u64)heap_min, core_min);
+
+    if (heap_min < 0 && core_min == ~(0ULL)) {
+        return -1;
+    } else if (heap_min < 0) {
+        return core_min;
+    } else if (core_min == ~(0ULL)) {
+        return (u64)heap_min;
+    } else {
+        return min(core_min, (u64)heap_min);
+    }
+}
+
+static s32 get_cpu_running_min_weight(u64 new_weight, u64 new_vtime, const struct cpumask *task_cpumask)
 {
     u64 zero = 0;
+    
     u64 min_weight = new_weight;
+    u64 max_vtime_running = new_vtime;
 
     s32 cpu_w_min_weight = -1;
-    u64 max_vtime_running = 0;
 
     int i = 0;
     u32 nr_cpu_ids = scx_bpf_nr_cpu_ids();
@@ -174,6 +212,7 @@ static s32 get_cpu_running_min_weight(u64 new_weight, const struct cpumask *task
         }
     }
 
+    if (want_to_print()) bpf_printk("kicking core %d w weight %llu and vtime %lld", cpu_w_min_weight, min_weight, max_vtime_running);
     return cpu_w_min_weight;
     
 }
@@ -186,6 +225,7 @@ static int init_task_info(struct task_struct *p, struct cgroup_info *gi)
     task_info->cgid = gi->group_id;
     task_info->time_started_running = 0;
     task_info->runnable_enqed = 0;
+    task_info->ts_enqueued = 0;
     return 0;
 }
 
@@ -418,26 +458,22 @@ void BPF_STRUCT_OPS(h_runnable, struct task_struct *p, u64 enq_flags)
 
     if (want_to_print()) bpf_printk("runnable: pid=%d, gid=%d, flags=%x", p->pid, cgrp->kn->id, enq_flags);
 
-    // ENQUEUE_RESTORE is 0x02
-    // "Restoring a running task will be immediately followed by set_next_task_scx()"
-
-    // if ((enq_flags & 0x02) || (enq_flags & 0x01)) {
-    // somehow this means that there won't be an enqueue after?
-    u32 old_nt = __sync_fetch_and_add(&gi->nthreads, 1);
-
     u32 dsq_id = 0;
-    s64 curr_min = scx_bpf_dsq_peek_head_vtime(dsq_id);
+    s64 curr_min = get_min_vtime(p->cpus_ptr, true);
     if (curr_min < 0) {
         curr_min = 0;
     }
 
+    bpf_spin_lock(&heap_lock);
+    u32 old_nt = __sync_fetch_and_add(&gi->nthreads, 1);
+
     if (old_nt == 0) {
         u64 lag = gi->vtime - gi->min_vtime_at_sleep;
-        if (lag > curr_min) {
+        if (gi->min_vtime_at_sleep > curr_min) {
             lag += gi->min_vtime_at_sleep - curr_min;
         }
-        if (want_to_print()) bpf_printk("(runnable)enqueue waking grp: pid=%d, curr_min=%llu, old_vt=%llu, min_vt_sleep=%llu, lag=%llu", p->pid, curr_min, gi->vtime, gi->min_vtime_at_sleep, lag);
-        // u64 lag = 0;
+        // bpf_printk("(runnable) waking grp: pid=%d, curr_min=%llu, old_vt=%llu, min_vt_sleep=%llu, lag=%llu", p->pid, curr_min, gi->vtime, gi->min_vtime_at_sleep, lag);
+        // is this the race? second adds, waking overwrites then adds
         gi->vtime = curr_min + lag;
     }
 
@@ -447,14 +483,18 @@ void BPF_STRUCT_OPS(h_runnable, struct task_struct *p, u64 enq_flags)
     u64 weighted_tick = (MY_SLICE / gi->hweight);
     u64 new_grp_vt = __sync_add_and_fetch(&gi->vtime, weighted_tick);
 
-    ti->runnable_enqed = 1;
+    bpf_spin_unlock(&heap_lock);
 
-    if (want_to_print()) bpf_printk("(runnable)enqueue: pid=%d, gid=%d, flags=%x, grp_w=%llu, new_nt=%d, new_grp_vt=%llu, p_vt=%llu", p->pid, cgrp->kn->id, enq_flags, gi->hweight, old_nt +1, new_grp_vt, p->scx.dsq_vtime);
+    ti->runnable_enqed = 1;
+    ti->ts_enqueued = bpf_ktime_get_ns();
+
+    bpf_printk("(runnable)enqueue: pid=%d, gid=%d, flags=%x, grp_w=%llu, new_nt=%d, new_grp_vt=%llu, p_vt=%llu", p->pid, cgrp->kn->id, enq_flags, gi->hweight, old_nt +1, new_grp_vt, p->scx.dsq_vtime);
 
     // }
     
-    s32 core_to_kick = get_cpu_running_min_weight(gi->hweight, p->cpus_ptr);
+    s32 core_to_kick = get_cpu_running_min_weight(gi->hweight, gi->vtime, p->cpus_ptr);
     if (core_to_kick > 0) {
+        // use kick_idle if the core is idle?
         scx_bpf_kick_cpu((u32)core_to_kick, SCX_KICK_PREEMPT);
     }
 
@@ -508,7 +548,7 @@ void BPF_STRUCT_OPS(h_enqueue, struct task_struct *p, u64 enq_flags)
         }
     }
 
-    s64 curr_min = scx_bpf_dsq_peek_head_vtime(dsq_id);
+    s64 curr_min = get_min_vtime(p->cpus_ptr, false);
     if (curr_min < 0) {
         curr_min = 0;
     }
@@ -554,10 +594,11 @@ void BPF_STRUCT_OPS(h_quiescent, struct task_struct *p, u64 deq_flags)
     u32 new_nt = __sync_sub_and_fetch(&gi->nthreads, 1);
 
     u32 dsq_id = 0;
-    s64 curr_min = scx_bpf_dsq_peek_head_vtime(dsq_id);
+    s64 curr_min = get_min_vtime(p->cpus_ptr, false);
     if (curr_min < 0) {
         // because if the heap is empty then it was the min, want to remember that, rather than a "fake" min of 0
         // TODO: what if something enqueued in the middle? ie while the task was off b/c it was scheduled, some new task came in and now has a tiny vt
+        // curr_min = 0;
         curr_min = gi->vtime;
     }
 
@@ -594,6 +635,7 @@ static void pick_min_heap(struct min_dsq_info *result) {
 void BPF_STRUCT_OPS(h_dispatch, s32 cpu, struct task_struct *prev)
 {
     u64 dsq_id = 0;
+    struct core_info *ci = get_core_info(-1);
 
     // pretty sure this is racy - we aren't locking it and so two threads can do this in lockstep
     // for now not a problem since we only have one heap
@@ -602,6 +644,13 @@ void BPF_STRUCT_OPS(h_dispatch, s32 cpu, struct task_struct *prev)
 
     // there is nothing on the q, keep running prev if possible (is automatic), else we have nothing to run
     if (min_heap.id < 0) {
+        if (prev && !(prev->scx.flags & SCX_TASK_QUEUED)) {
+            if (want_to_print()) bpf_printk("going idle");
+            if (ci) {
+                ci->weight_running = 0;
+                ci->vtime_running = 0;
+            }
+        }
         // if (want_to_print()) bpf_printk("dispatch: cpu=%ld, prev=%d, prev_queued=%d, heap_empty", cpu, prev ? prev->pid : -1, prev ? (prev->scx.flags & SCX_TASK_QUEUED) : 0);
         return;
     }
@@ -641,6 +690,9 @@ void BPF_STRUCT_OPS(h_dispatch, s32 cpu, struct task_struct *prev)
 
             // "running" is not called again, so time_started_running is never reset; do it here instead
             prev_i->time_started_running = bpf_ktime_get_ns();
+            if (ci) {
+                ci->vtime_running = new_p_vt;
+            }
 
             // effectively we are doing a yield->enqueue->pick, print that explicitly for cmp with spec
             if (want_to_print()) bpf_printk("(dispatch, using_prev)stopping: pid=%d, gid=%d, runnable=%d, time_used=%llu, grp_w=%lu, new_grp_vt=%llu", prev->pid, prev_gi->group_id, 1, prev_time_used, prev_gi->hweight, new_p_vt);
@@ -659,7 +711,7 @@ void BPF_STRUCT_OPS(h_dispatch, s32 cpu, struct task_struct *prev)
     }
 
 no_prev:
-    // if (want_to_print()) bpf_printk("dispatch: cpu=%ld, prev=-1, prev_queued=0, pulling_from_heap", cpu);
+    if (want_to_print()) bpf_printk("dispatch: cpu=%ld, prev=-1, prev_queued=0, pulling_from_heap", cpu);
     scx_bpf_dsq_move_to_local(min_heap.id);
 }
 
@@ -726,6 +778,9 @@ void BPF_STRUCT_OPS(h_running, struct task_struct *p)
     }
     ti->time_started_running = bpf_ktime_get_ns();
     
+    if (ti->runnable_enqed && ti->ts_enqueued > 0) {
+        bpf_printk("time to running=%llu, pid=%d, gid=%d", bpf_ktime_get_ns() - ti->ts_enqueued, p->pid, gi->group_id);
+    }
     ti->runnable_enqed = 0;
 
     struct core_info *ci = get_core_info(-1);
@@ -734,7 +789,7 @@ void BPF_STRUCT_OPS(h_running, struct task_struct *p)
         ci->weight_running = gi->hweight;
     }
 
-    if (want_to_print()) bpf_printk("running: pid=%d, gid=%d, ts=%llu, grp_w=%lu", p->pid, cgrp->kn->id, ti->time_started_running, gi->hweight);
+    if (want_to_print()) bpf_printk("running: pid=%d, gid=%d, ts=%llu, grp_w=%lu, p_vt=%llu", p->pid, cgrp->kn->id, ti->time_started_running, gi->hweight, p->scx.dsq_vtime);
 
     bpf_cgroup_release(cgrp);
 }

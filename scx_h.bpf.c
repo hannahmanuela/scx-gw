@@ -92,8 +92,8 @@ static bool want_to_print()
     // return true;
     // return bpf_get_smp_processor_id() == 2 || bpf_get_smp_processor_id() == 4;
     // return bpf_get_smp_processor_id() == 4;
-    // return bpf_get_smp_processor_id() == 2 || bpf_get_smp_processor_id() == 4 || bpf_get_smp_processor_id() == 6 || bpf_get_smp_processor_id() == 8;
-    return bpf_get_smp_processor_id() == 4 || bpf_get_smp_processor_id() == 6 || bpf_get_smp_processor_id() == 8 || bpf_get_smp_processor_id() == 10;
+    return bpf_get_smp_processor_id() == 2 || bpf_get_smp_processor_id() == 4 || bpf_get_smp_processor_id() == 6 || bpf_get_smp_processor_id() == 8;
+    // return bpf_get_smp_processor_id() == 4 || bpf_get_smp_processor_id() == 6 || bpf_get_smp_processor_id() == 8 || bpf_get_smp_processor_id() == 10;
 }
 
 
@@ -186,7 +186,12 @@ static s64 get_min_vtime(const struct cpumask *task_cpumask, bool print)
     }
 }
 
-static s32 get_cpu_running_min_weight(u64 new_weight, u64 new_vtime, const struct cpumask *task_cpumask)
+struct core_to_kick {
+    s32 core_id;
+    bool is_idle;
+};
+
+static void get_cpu_running_min_weight(u64 new_weight, u64 new_vtime, const struct cpumask *task_cpumask, struct core_to_kick *res)
 {
     u64 zero = 0;
     
@@ -213,7 +218,11 @@ static s32 get_cpu_running_min_weight(u64 new_weight, u64 new_vtime, const struc
     }
 
     if (want_to_print()) bpf_printk("kicking core %d w weight %llu and vtime %lld", cpu_w_min_weight, min_weight, max_vtime_running);
-    return cpu_w_min_weight;
+
+    res->core_id = cpu_w_min_weight;
+    res->is_idle = (min_weight == 0);
+
+    return;
     
 }
 
@@ -244,11 +253,11 @@ static u64 adjusted_grp_vtime(struct cgroup_info *gi, s64 time_passed)
     u64 expected = safe_div_u64(MY_SLICE, gi->hweight);
     if (weighted_time_passed < expected) {
         s64 diff = (s64)expected - (s64)weighted_time_passed;
-        if (want_to_print()) bpf_printk("ADJ: %d og_vtime=%llu, (sub)diff=%lld", gi->group_id, gi->vtime, diff);
+        // if (want_to_print()) bpf_printk("ADJ: %d og_vtime=%llu, (sub)diff=%lld", gi->group_id, gi->vtime, diff);
         return gi->vtime - diff;
     } else {
         s64 diff = (s64)weighted_time_passed - (s64)expected;
-        if (want_to_print()) bpf_printk("ADJ: %d og_vtime=%llu, (add)diff=%lld", gi->group_id, gi->vtime, diff);
+        // if (want_to_print()) bpf_printk("ADJ: %d og_vtime=%llu, (add)diff=%lld", gi->group_id, gi->vtime, diff);
         return gi->vtime + diff;
     }
     return gi->vtime;
@@ -431,6 +440,21 @@ void BPF_STRUCT_OPS(h_cgroup_move, struct task_struct *p, struct cgroup *from, s
 
 }
 
+
+s32 BPF_STRUCT_OPS(h_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
+{
+    bool is_idle = false;
+	s32 cpu;
+
+    // can't get cgroup from here, so don't actually do the enq to any dsq
+    // if there is an idle core, ext.c will kick it; that should then do the dispatch? or does it just do the pick?
+	cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+
+    bpf_printk("select_cpu: pid=%d, cpu=%ld", p->pid, cpu);
+
+	return cpu;
+}
+
 void BPF_STRUCT_OPS(h_runnable, struct task_struct *p, u64 enq_flags)
 {
     struct cgroup_info *gi;
@@ -492,10 +516,15 @@ void BPF_STRUCT_OPS(h_runnable, struct task_struct *p, u64 enq_flags)
 
     // }
     
-    s32 core_to_kick = get_cpu_running_min_weight(gi->hweight, gi->vtime, p->cpus_ptr);
-    if (core_to_kick > 0) {
-        // use kick_idle if the core is idle?
-        scx_bpf_kick_cpu((u32)core_to_kick, SCX_KICK_PREEMPT);
+    struct core_to_kick kick_core;
+    get_cpu_running_min_weight(gi->hweight, gi->vtime, p->cpus_ptr, &kick_core);
+    bpf_printk("core to kick: id=%ld, idl=%d", kick_core.core_id, kick_core.is_idle);
+    if (kick_core.core_id > 0) {
+        if (kick_core.is_idle) {
+            scx_bpf_kick_cpu((u32)kick_core.core_id, SCX_KICK_IDLE);
+        } else {
+            scx_bpf_kick_cpu(kick_core.core_id, SCX_KICK_PREEMPT);
+        }        
     }
 
     
@@ -573,6 +602,17 @@ void BPF_STRUCT_OPS(h_enqueue, struct task_struct *p, u64 enq_flags)
 
     scx_bpf_dsq_insert_vtime(p, dsq_id, MY_SLICE, p->scx.dsq_vtime, enq_flags);
 
+    struct core_to_kick kick_core;
+    get_cpu_running_min_weight(gi->hweight, gi->vtime, p->cpus_ptr, &kick_core);
+    bpf_printk("core to kick: id=%ld, idl=%d", kick_core.core_id, kick_core.is_idle);
+    if (kick_core.core_id > 0) {
+        if (kick_core.is_idle) {
+            scx_bpf_kick_cpu((u32)kick_core.core_id, SCX_KICK_IDLE);
+        } else {
+            scx_bpf_kick_cpu(kick_core.core_id, SCX_KICK_PREEMPT);
+        }        
+    }
+
     bpf_cgroup_release(cgrp);
 }
 
@@ -637,82 +677,91 @@ void BPF_STRUCT_OPS(h_dispatch, s32 cpu, struct task_struct *prev)
     u64 dsq_id = 0;
     struct core_info *ci = get_core_info(-1);
 
-    // pretty sure this is racy - we aren't locking it and so two threads can do this in lockstep
-    // for now not a problem since we only have one heap
-    struct min_dsq_info min_heap;
-    pick_min_heap(&min_heap);
 
-    // there is nothing on the q, keep running prev if possible (is automatic), else we have nothing to run
-    if (min_heap.id < 0) {
-        if (prev && !(prev->scx.flags & SCX_TASK_QUEUED)) {
+    // if there is no previous/it is not runnable, just pull from heap (if possible, the function just returns false if there is nothing to move)
+    if (!prev || prev && !(prev->scx.flags & SCX_TASK_QUEUED)) {
+        if (want_to_print()) bpf_printk("dispatch: cpu=%ld, prev=%d, prev_queued=0, pulling_from_heap", prev ? prev->pid : -1, cpu);
+        bool task_found = scx_bpf_dsq_move_to_local(dsq_id);
+        if (!task_found) {
             if (want_to_print()) bpf_printk("going idle");
             if (ci) {
                 ci->weight_running = 0;
                 ci->vtime_running = 0;
             }
         }
-        // if (want_to_print()) bpf_printk("dispatch: cpu=%ld, prev=%d, prev_queued=%d, heap_empty", cpu, prev ? prev->pid : -1, prev ? (prev->scx.flags & SCX_TASK_QUEUED) : 0);
         return;
     }
 
-    if (prev && (prev->scx.flags & SCX_TASK_QUEUED)) { // have a previous, and it is on the rq
 
-        struct task_info *prev_i = get_task_info(prev);
-        if (!prev_i) 
-            goto no_prev;
+    // if we're here, we have a previous, and it is on the rq
 
-        struct cgroup_info *prev_gi;
-        struct cgroup *cgrp = bpf_cgroup_from_id(prev_i->cgid);
-        if (!cgrp) {
-            if (cgrp) bpf_cgroup_release(cgrp);
-            goto no_prev;
-        }
-        prev_gi = get_cgroup_info(cgrp);
-        if (!prev_gi) {
-            bpf_cgroup_release(cgrp);
-            goto no_prev;
-        }
+    struct task_info *prev_i = get_task_info(prev);
+    if (!prev_i) {
+       return;
+    }
 
-        // refresh so that the weight we use below is correct
-        refresh_cgrp_hweight(cgrp, prev_gi);
-
-        // only actually advance the time if the process is chosen to run next, otherwise "stopping" will do that for us
-        s64 prev_time_used = (s64)bpf_ktime_get_ns() - (s64)prev_i->time_started_running;
-
-        u64 new_p_vt = adjusted_grp_vtime(prev_gi, prev_time_used);
-        
-        if (new_p_vt <= min_heap.vtime) {
-            prev->scx.slice = MY_SLICE;
-
-            u64 weighted_tick = (MY_SLICE / prev_gi->hweight);
-            u64 new_grp_vt = new_p_vt + weighted_tick;
-            __sync_lock_test_and_set(&prev_gi->vtime, new_grp_vt);
-
-            // "running" is not called again, so time_started_running is never reset; do it here instead
-            prev_i->time_started_running = bpf_ktime_get_ns();
-            if (ci) {
-                ci->vtime_running = new_p_vt;
-            }
-
-            // effectively we are doing a yield->enqueue->pick, print that explicitly for cmp with spec
-            if (want_to_print()) bpf_printk("(dispatch, using_prev)stopping: pid=%d, gid=%d, runnable=%d, time_used=%llu, grp_w=%lu, new_grp_vt=%llu", prev->pid, prev_gi->group_id, 1, prev_time_used, prev_gi->hweight, new_p_vt);
-            if (want_to_print()) bpf_printk("(dispatch, using_prev)enqueue: pid=%d, gid=%d, flags=0, grp_w=%llu, new_nt=%d, new_grp_vt=%llu, p_vt=%llu", prev->pid, prev_gi->group_id, prev_gi->hweight, prev_gi->nthreads, new_grp_vt, new_p_vt);
-            if (want_to_print()) bpf_printk("(dispatch, using_prev)running: pid=%d, gid=%d, ts=%llu, grp_w=%lu", prev->pid, prev_gi->group_id, prev_i->time_started_running, prev_gi->hweight);
-
-            bpf_cgroup_release(cgrp);
-            return;
-        }
+    struct cgroup_info *prev_gi;
+    struct cgroup *cgrp = bpf_cgroup_from_id(prev_i->cgid);
+    if (!cgrp) {
+        if (cgrp) bpf_cgroup_release(cgrp);
+        return;
+    }
+    prev_gi = get_cgroup_info(cgrp);
+    if (!prev_gi) {
         bpf_cgroup_release(cgrp);
-
-        if (want_to_print()) bpf_printk("dispatch: cpu=%ld, prev=%d, pot_new_vt=%llu, curr_min=%llu, pulling_from_heap", cpu, prev->pid, new_p_vt, min_heap.vtime);
-
-        scx_bpf_dsq_move_to_local(min_heap.id);
         return;
     }
 
-no_prev:
-    if (want_to_print()) bpf_printk("dispatch: cpu=%ld, prev=-1, prev_queued=0, pulling_from_heap", cpu);
+    // refresh so that the weight we use below is correct
+    refresh_cgrp_hweight(cgrp, prev_gi);
+
+    // need to do this before locking (func calls not allowed during the lock)
+    // only actually advance the time if the process is chosen to run next, otherwise "stopping" will do that for us
+    s64 prev_time_used = (s64)bpf_ktime_get_ns() - (s64)prev_i->time_started_running;
+
+    bpf_spin_lock(&heap_lock);
+    struct min_dsq_info min_heap;
+    pick_min_heap(&min_heap);
+
+    u64 new_p_vt = adjusted_grp_vtime(prev_gi, prev_time_used);
+    
+    if (min_heap.id < 0 || new_p_vt <= min_heap.vtime) {
+        bpf_spin_unlock(&heap_lock);
+        prev->scx.slice = MY_SLICE;
+
+        u64 weighted_tick = (MY_SLICE / prev_gi->hweight);
+        u64 new_grp_vt = new_p_vt + weighted_tick;
+        __sync_lock_test_and_set(&prev_gi->vtime, new_grp_vt);
+
+        // "running" is not called again, so time_started_running is never reset; do it here instead
+        prev_i->time_started_running = bpf_ktime_get_ns();
+        if (ci) {
+            ci->vtime_running = new_p_vt;
+        }
+
+        // effectively we are doing a yield->enqueue->pick, print that explicitly for cmp with spec
+        if (want_to_print()) bpf_printk("re-running prev: vt=%llu, min_h=%d, curr_min=%llu", new_p_vt, min_heap.id,  min_heap.vtime);
+        if (want_to_print()) bpf_printk("(dispatch, using_prev)stopping: pid=%d, gid=%d, runnable=%d, time_used=%llu, grp_w=%lu, new_grp_vt=%llu", prev->pid, prev_gi->group_id, 1, prev_time_used, prev_gi->hweight, new_p_vt);
+        if (want_to_print()) bpf_printk("(dispatch, using_prev)enqueue: pid=%d, gid=%d, flags=0, grp_w=%llu, new_nt=%d, new_grp_vt=%llu, p_vt=%llu", prev->pid, prev_gi->group_id, prev_gi->hweight, prev_gi->nthreads, new_grp_vt, new_p_vt);
+        if (want_to_print()) bpf_printk("(dispatch, using_prev)running: pid=%d, gid=%d, ts=%llu, grp_w=%lu", prev->pid, prev_gi->group_id, prev_i->time_started_running, prev_gi->hweight);
+
+        bpf_cgroup_release(cgrp);
+        return;
+    }
+
+    s64 reserved_task_vtime = scx_bpf_dsq_reserve_head(dsq_id);
+
+    bpf_spin_unlock(&heap_lock);    
+    bpf_cgroup_release(cgrp);
+
+    if (reserved_task_vtime != min_heap.vtime) {
+        bpf_printk("race bug?? we held the lock the whole time though...");
+    }
+
+    if (want_to_print()) bpf_printk("dispatch: cpu=%ld, prev=%d, pot_new_vt=%llu, curr_min=%llu, pulling_from_heap", cpu, prev->pid, new_p_vt, min_heap.vtime);
+
     scx_bpf_dsq_move_to_local(min_heap.id);
+    return;
 }
 
 void BPF_STRUCT_OPS(h_stopping, struct task_struct *p, bool runnable)
@@ -789,7 +838,10 @@ void BPF_STRUCT_OPS(h_running, struct task_struct *p)
         ci->weight_running = gi->hweight;
     }
 
-    if (want_to_print()) bpf_printk("running: pid=%d, gid=%d, ts=%llu, grp_w=%lu, p_vt=%llu", p->pid, cgrp->kn->id, ti->time_started_running, gi->hweight, p->scx.dsq_vtime);
+    // TODO: this is a hack, move from dispatch should have set it to false? but somehow it's not
+    p->scx.reserved = false;
+
+    if (want_to_print()) bpf_printk("running: pid=%d, gid=%d, ts=%llu, grp_w=%lu, p_vt=%llu, reserved=%d", p->pid, cgrp->kn->id, ti->time_started_running, gi->hweight, p->scx.dsq_vtime, p->scx.reserved);
 
     bpf_cgroup_release(cgrp);
 }
@@ -816,6 +868,7 @@ void BPF_STRUCT_OPS(h_exit, struct scx_exit_info *ei)
 
 SCX_OPS_DEFINE(h_ops,
         .init_task		= (void *)h_init_task,
+        .select_cpu     = (void *)h_select_cpu,
         .runnable		= (void *)h_runnable,
         .enqueue        = (void *)h_enqueue,
         .dispatch		= (void *)h_dispatch,

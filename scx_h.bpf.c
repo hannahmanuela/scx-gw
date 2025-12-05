@@ -94,11 +94,11 @@ struct {
 
 static bool want_to_print()
 {
-    return false;
+    // return false;
     // return true;
     // return bpf_get_smp_processor_id() == 2 || bpf_get_smp_processor_id() == 4;
     // return bpf_get_smp_processor_id() == 4;
-    // return bpf_get_smp_processor_id() == 2 || bpf_get_smp_processor_id() == 4 || bpf_get_smp_processor_id() == 6 || bpf_get_smp_processor_id() == 8;
+    return bpf_get_smp_processor_id() == 2 || bpf_get_smp_processor_id() == 4 || bpf_get_smp_processor_id() == 6 || bpf_get_smp_processor_id() == 8;
     // return bpf_get_smp_processor_id() == 4 || bpf_get_smp_processor_id() == 6 || bpf_get_smp_processor_id() == 8 || bpf_get_smp_processor_id() == 10;
 }
 
@@ -703,19 +703,38 @@ static void dispatch_no_prev(s32 cpu)
     struct core_info *ci = get_core_info(-1);
 
     struct min_dsq_info min_heap;
-    pick_min_heap(&min_heap);
-    if (!min_heap.heap_info) {
+    bool found_heap = false;
+    for (int i=0; i < 50; i++) {    
+        min_heap.heap_info = NULL; // reset
+        pick_min_heap(&min_heap);
+        if (!min_heap.heap_info) {
+            // keep running prev
+            break;
+        }
+        bpf_spin_lock(&min_heap.heap_info->heap_lock);
+        u64 locked_min = scx_bpf_dsq_peek_head_vtime(min_heap.heap_info->heap_id);
+        if (locked_min < 0) locked_min = ~(0ULL);
+        if (locked_min == min_heap.vtime) {
+            found_heap = true;
+            break;
+        } else {
+            bpf_spin_unlock(&min_heap.heap_info->heap_lock);
+        }
+    }
+    if (!found_heap) {
+        if (want_to_print()) bpf_printk("dispatch (no prev) failed to find a min heap");
         if (ci) {
             ci->weight_running = 0;
             ci->vtime_running = 0;
         }
         return;
     }
-    bpf_spin_lock(&min_heap.heap_info->heap_lock);
 
     scx_bpf_dsq_reserve_head(min_heap.heap_info->heap_id);
     bpf_spin_unlock(&min_heap.heap_info->heap_lock);
     scx_bpf_dsq_move_to_local(min_heap.heap_info->heap_id);
+
+    if (want_to_print()) bpf_printk("dispatch: (no prev) locked and read from heap %d", min_heap.heap_info->heap_id);
 
 }
 
@@ -764,17 +783,18 @@ static void dispatch_w_prev(s32 cpu, struct task_struct *prev)
             break;
         } else {
             bpf_spin_unlock(&min_heap.heap_info->heap_lock);
-            bpf_printk("locked min: %llu, og min: %llu", locked_min, min_heap.vtime);
         }
     }
     if (!found_heap) {
-        bpf_printk("dispatch failed to find a min heap");
+        if (want_to_print()) bpf_printk("dispatch (prev) failed to find a min heap");
         return;
     }
 
 
     if (new_p_vt <= min_heap.vtime) {
         bpf_spin_unlock(&min_heap.heap_info->heap_lock);
+
+        if (want_to_print()) bpf_printk("dispatch: (prev) locked and reading heap %d, running prev", min_heap.heap_info->heap_id);
         
         prev->scx.slice = MY_SLICE;
 
@@ -793,12 +813,11 @@ static void dispatch_w_prev(s32 cpu, struct task_struct *prev)
 
     s64 reserved_task_vtime = scx_bpf_dsq_reserve_head(min_heap.heap_info->heap_id);
     bpf_spin_unlock(&min_heap.heap_info->heap_lock);
-    
-    if (reserved_task_vtime != min_heap.vtime) {
-        bpf_printk("race bug?? we held the lock the whole time though...");
-    }
 
     scx_bpf_dsq_move_to_local(min_heap.heap_info->heap_id);
+
+    if (want_to_print()) bpf_printk("dispatch: (prev) locked and reading heap %d, pulling from it", min_heap.heap_info->heap_id);
+
     return;
 
 }
@@ -809,10 +828,10 @@ void BPF_STRUCT_OPS(h_dispatch, s32 cpu, struct task_struct *prev)
     u64 dispatch_start = bpf_ktime_get_ns();
     if (prev && (prev->scx.flags & SCX_TASK_QUEUED)) {
         dispatch_w_prev(cpu, prev);
-        bpf_printk("dispatch took %llu ns", bpf_ktime_get_ns() - dispatch_start);
+        // bpf_printk("dispatch took %llu ns", bpf_ktime_get_ns() - dispatch_start);
     } else {
         dispatch_no_prev(cpu);
-        bpf_printk("dispatch took %llu ns", bpf_ktime_get_ns() - dispatch_start);
+        // bpf_printk("dispatch took %llu ns", bpf_ktime_get_ns() - dispatch_start);
     }
     
 

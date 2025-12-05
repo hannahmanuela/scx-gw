@@ -8,14 +8,13 @@ UEI_DEFINE(uei);
 // DEFINES
 // =======================================================
 
-#define NUM_HEAPS 1
+#define NUM_HEAPS 8
+#define NUM_HEAPS_TO_SAMPLE 2
 #define MY_SLICE ((__u64)4 * 1000000) // 4ms
 #define HWEIGHT_ONE 1LLU << 16 // copied over from flatcg
 
 // used to see if a group's hweight has been updated since the last tree change
 u64 hweight_gen = 1;
-
-private(P_HEAP) struct bpf_spin_lock heap_lock;
 
 // =======================================================
 // DATA STRUCTURES
@@ -34,6 +33,8 @@ struct cgroup_info {
 
     u64 vtime;          // group vtime
     u64 min_vtime_at_sleep;   // min vt at sleep time
+
+    struct bpf_spin_lock group_lock;
 };
 
 struct task_info {
@@ -47,6 +48,11 @@ struct task_info {
 struct core_info {
     u32 weight_running;
     u32 vtime_running;
+};
+
+struct heap_info {
+    u32 heap_id;
+    struct bpf_spin_lock heap_lock;
 };
 
 // =======================================================
@@ -64,9 +70,9 @@ struct {
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
 	__type(key, u32);
-	__type(value, s64);
+	__type(value, struct heap_info);
 	__uint(max_entries, NUM_HEAPS);
-} heap_min_vrt SEC(".maps");
+} heap_info_map SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
@@ -129,6 +135,13 @@ static inline u64 min(u64 a, u64 b)
 	return a;
 }
 
+static void get_heap_ids_to_sample(int *heap_ids_to_sample) {
+    u32 heap_to_start_from = bpf_get_prandom_u32() % NUM_HEAPS;
+    for (int i = 0; i < NUM_HEAPS_TO_SAMPLE; i++) {
+        heap_ids_to_sample[i] = heap_to_start_from + i;
+    }
+}
+
 /* Helper functions for active groups management */
 
 static struct cgroup_info *get_cgroup_info(struct cgroup *cgrp)
@@ -150,12 +163,18 @@ struct core_info *get_core_info(s64 core_id)
     return ci;
 }
 
-static s64 get_min_vtime(const struct cpumask *task_cpumask, bool print) 
+static s64 get_min_vtime(const struct cpumask *task_cpumask, bool print, int heap_ids_to_sample[NUM_HEAPS_TO_SAMPLE]) 
 {
     u32 own_cpu = bpf_get_smp_processor_id();
 
-    u64 dsq_id = 0;
-    s64 heap_min = scx_bpf_dsq_peek_head_vtime(dsq_id);
+    s64 heap_min = -1;
+    for (int i = 0; i < NUM_HEAPS_TO_SAMPLE; i++) {
+        u64 heap_id = heap_ids_to_sample[i];
+        s64 heap_i_min = scx_bpf_dsq_peek_head_vtime(heap_id);
+        if (heap_i_min >= 0 && heap_i_min < heap_min) {
+            heap_min = heap_i_min;
+        }
+    }
 
     u64 core_min = ~(0ULL);
 
@@ -482,13 +501,14 @@ void BPF_STRUCT_OPS(h_runnable, struct task_struct *p, u64 enq_flags)
 
     if (want_to_print()) bpf_printk("runnable: pid=%d, gid=%d, flags=%x", p->pid, cgrp->kn->id, enq_flags);
 
-    u32 dsq_id = 0;
-    s64 curr_min = get_min_vtime(p->cpus_ptr, true);
+    int heap_ids_to_sample[NUM_HEAPS_TO_SAMPLE];
+    get_heap_ids_to_sample(heap_ids_to_sample);
+    s64 curr_min = get_min_vtime(p->cpus_ptr, true, heap_ids_to_sample);
     if (curr_min < 0) {
         curr_min = 0;
     }
 
-    bpf_spin_lock(&heap_lock);
+    bpf_spin_lock(&gi->group_lock);
     u32 old_nt = __sync_fetch_and_add(&gi->nthreads, 1);
 
     if (old_nt == 0) {
@@ -507,19 +527,17 @@ void BPF_STRUCT_OPS(h_runnable, struct task_struct *p, u64 enq_flags)
     u64 weighted_tick = (MY_SLICE / gi->hweight);
     u64 new_grp_vt = __sync_add_and_fetch(&gi->vtime, weighted_tick);
 
-    bpf_spin_unlock(&heap_lock);
+    bpf_spin_unlock(&gi->group_lock);
 
     ti->runnable_enqed = 1;
     ti->ts_enqueued = bpf_ktime_get_ns();
 
     bpf_printk("(runnable)enqueue: pid=%d, gid=%d, flags=%x, grp_w=%llu, new_nt=%d, new_grp_vt=%llu, p_vt=%llu", p->pid, cgrp->kn->id, enq_flags, gi->hweight, old_nt +1, new_grp_vt, p->scx.dsq_vtime);
-
-    // }
     
     struct core_to_kick kick_core;
     get_cpu_running_min_weight(gi->hweight, gi->vtime, p->cpus_ptr, &kick_core);
     bpf_printk("core to kick: id=%ld, idl=%d", kick_core.core_id, kick_core.is_idle);
-    if (kick_core.core_id > 0) {
+    if (kick_core.core_id > 0) { //  && (kick_core.core_id != bpf_get_smp_processor_id())
         if (kick_core.is_idle) {
             scx_bpf_kick_cpu((u32)kick_core.core_id, SCX_KICK_IDLE);
         } else {
@@ -548,7 +566,7 @@ void BPF_STRUCT_OPS(h_enqueue, struct task_struct *p, u64 enq_flags)
     // refresh so that the weight we use below is correct
     refresh_cgrp_hweight(cgrp, gi);
 
-    u32 dsq_id = 0;
+    int heap_id = bpf_get_prandom_u32() % NUM_HEAPS;
 
     struct task_info *ti = get_task_info(p);
     if (!ti) {
@@ -558,8 +576,8 @@ void BPF_STRUCT_OPS(h_enqueue, struct task_struct *p, u64 enq_flags)
     }
 
     if (ti->runnable_enqed) {
-        if (want_to_print()) bpf_printk("enq %d, skipping b/c runnable enqueued", p->pid);
-        scx_bpf_dsq_insert_vtime(p, dsq_id, MY_SLICE, p->scx.dsq_vtime, enq_flags);
+        if (want_to_print()) bpf_printk("enq %d, runnable enqueued, putting into heap %d", p->pid, heap_id);
+        scx_bpf_dsq_insert_vtime(p, heap_id, MY_SLICE, p->scx.dsq_vtime, enq_flags);
         bpf_cgroup_release(cgrp);
         return;
     }
@@ -577,7 +595,9 @@ void BPF_STRUCT_OPS(h_enqueue, struct task_struct *p, u64 enq_flags)
         }
     }
 
-    s64 curr_min = get_min_vtime(p->cpus_ptr, false);
+    int heap_ids_to_sample[NUM_HEAPS_TO_SAMPLE];
+    get_heap_ids_to_sample(heap_ids_to_sample);
+    s64 curr_min = get_min_vtime(p->cpus_ptr, false, heap_ids_to_sample);
     if (curr_min < 0) {
         curr_min = 0;
     }
@@ -598,9 +618,9 @@ void BPF_STRUCT_OPS(h_enqueue, struct task_struct *p, u64 enq_flags)
     u64 weighted_tick = (MY_SLICE / gi->hweight);
     u64 new_grp_vt = __sync_add_and_fetch(&gi->vtime, weighted_tick);
         
-    if (want_to_print()) bpf_printk("enqueue: pid=%d, gid=%d, flags=%x, grp_w=%llu, new_nt=%d, new_grp_vt=%llu, p_vt=%llu", p->pid, cgrp->kn->id, enq_flags, gi->hweight, new_nt, new_grp_vt, p->scx.dsq_vtime);    
+    if (want_to_print()) bpf_printk("enqueue: pid=%d, gid=%d, flags=%x, grp_w=%llu, new_nt=%d, new_grp_vt=%llu, p_vt=%llu, into_heap=%d", p->pid, cgrp->kn->id, enq_flags, gi->hweight, new_nt, new_grp_vt, p->scx.dsq_vtime, heap_id);    
 
-    scx_bpf_dsq_insert_vtime(p, dsq_id, MY_SLICE, p->scx.dsq_vtime, enq_flags);
+    scx_bpf_dsq_insert_vtime(p, heap_id, MY_SLICE, p->scx.dsq_vtime, enq_flags);
 
     struct core_to_kick kick_core;
     get_cpu_running_min_weight(gi->hweight, gi->vtime, p->cpus_ptr, &kick_core);
@@ -633,8 +653,9 @@ void BPF_STRUCT_OPS(h_quiescent, struct task_struct *p, u64 deq_flags)
     // quiesc is not called as part of the set_prev/put_next flow
     u32 new_nt = __sync_sub_and_fetch(&gi->nthreads, 1);
 
-    u32 dsq_id = 0;
-    s64 curr_min = get_min_vtime(p->cpus_ptr, false);
+    int heap_ids_to_sample[NUM_HEAPS_TO_SAMPLE];
+    get_heap_ids_to_sample(heap_ids_to_sample);
+    s64 curr_min = get_min_vtime(p->cpus_ptr, false, heap_ids_to_sample);
     if (curr_min < 0) {
         // because if the heap is empty then it was the min, want to remember that, rather than a "fake" min of 0
         // TODO: what if something enqueued in the middle? ie while the task was off b/c it was scheduled, some new task came in and now has a tiny vt
@@ -652,7 +673,7 @@ void BPF_STRUCT_OPS(h_quiescent, struct task_struct *p, u64 deq_flags)
 }
 
 struct min_dsq_info {
-    int id;
+    struct heap_info *heap_info;
     u64 vtime;
 };
 
@@ -660,73 +681,85 @@ static void pick_min_heap(struct min_dsq_info *result) {
     int curr_min_heap = -1;
     u64 curr_min_vt = ~(0ULL);
         
-    u64 dsq_id = 0;
-    s64 heap_min = scx_bpf_dsq_peek_head_vtime(dsq_id);
-    if (heap_min >= 0 && heap_min < curr_min_vt) {
-        curr_min_heap = dsq_id;
-        curr_min_vt = heap_min;
+    int heap_to_start_from = bpf_get_prandom_u32() % NUM_HEAPS;
+    int heap_id = heap_to_start_from;
+    for (int count_tried = 0; count_tried < NUM_HEAPS; count_tried++) {
+        heap_id = (heap_id + 1) % NUM_HEAPS;
+        s64 heap_min = scx_bpf_dsq_peek_head_vtime(heap_id);
+        if (heap_min >= 0 && heap_min < curr_min_vt) {
+            curr_min_heap = heap_id;
+            curr_min_vt = heap_min;
+        }
     }
     
-    result->id = curr_min_heap;
+    result->heap_info = bpf_map_lookup_elem(&heap_info_map, &curr_min_heap);
     result->vtime = curr_min_vt;
 }
 
 
-void BPF_STRUCT_OPS(h_dispatch, s32 cpu, struct task_struct *prev)
+static void dispatch_no_prev(s32 cpu)
 {
-    u64 dsq_id = 0;
+
     struct core_info *ci = get_core_info(-1);
 
-
-    // if there is no previous/it is not runnable, just pull from heap (if possible, the function just returns false if there is nothing to move)
-    if (!prev || prev && !(prev->scx.flags & SCX_TASK_QUEUED)) {
-        if (want_to_print()) bpf_printk("dispatch: cpu=%ld, prev=%d, prev_queued=0, pulling_from_heap", prev ? prev->pid : -1, cpu);
-        bool task_found = scx_bpf_dsq_move_to_local(dsq_id);
-        if (!task_found) {
-            if (want_to_print()) bpf_printk("going idle");
-            if (ci) {
-                ci->weight_running = 0;
-                ci->vtime_running = 0;
-            }
+    struct min_dsq_info min_heap;
+    pick_min_heap(&min_heap);
+    if (!min_heap.heap_info) {
+        if (want_to_print()) bpf_printk("going idle");
+        if (ci) {
+            ci->weight_running = 0;
+            ci->vtime_running = 0;
         }
         return;
     }
+    bpf_spin_lock(&min_heap.heap_info->heap_lock);
 
+    scx_bpf_dsq_reserve_head(min_heap.heap_info->heap_id);
+    bpf_spin_unlock(&min_heap.heap_info->heap_lock);
+    if (want_to_print()) bpf_printk("dispatch: cpu=%ld, no_prev, pulling_from_heap %d", cpu, min_heap.heap_info->heap_id);
+    scx_bpf_dsq_move_to_local(min_heap.heap_info->heap_id);
 
-    // if we're here, we have a previous, and it is on the rq
+}
+
+static void dispatch_w_prev(s32 cpu, struct task_struct *prev)
+{
+
+    if (!prev) {
+        return;
+    }
+
+    struct core_info *ci = get_core_info(-1);
 
     struct task_info *prev_i = get_task_info(prev);
-    if (!prev_i) {
-       return;
-    }
+    if (!prev_i) return;
 
-    struct cgroup_info *prev_gi;
     struct cgroup *cgrp = bpf_cgroup_from_id(prev_i->cgid);
-    if (!cgrp) {
-        if (cgrp) bpf_cgroup_release(cgrp);
-        return;
-    }
-    prev_gi = get_cgroup_info(cgrp);
-    if (!prev_gi) {
-        bpf_cgroup_release(cgrp);
-        return;
-    }
+    if (!cgrp) { if (cgrp) { bpf_cgroup_release(cgrp);} return; }
+    
+    struct cgroup_info *prev_gi = get_cgroup_info(cgrp);
+    if (!prev_gi) { bpf_cgroup_release(cgrp); return; }
 
-    // refresh so that the weight we use below is correct
     refresh_cgrp_hweight(cgrp, prev_gi);
+
+    bpf_cgroup_release(cgrp);
 
     // need to do this before locking (func calls not allowed during the lock)
     // only actually advance the time if the process is chosen to run next, otherwise "stopping" will do that for us
-    s64 prev_time_used = (s64)bpf_ktime_get_ns() - (s64)prev_i->time_started_running;
-
-    bpf_spin_lock(&heap_lock);
-    struct min_dsq_info min_heap;
-    pick_min_heap(&min_heap);
+    u64 prev_time_used = (s64)bpf_ktime_get_ns() - (s64)prev_i->time_started_running;
 
     u64 new_p_vt = adjusted_grp_vtime(prev_gi, prev_time_used);
-    
-    if (min_heap.id < 0 || new_p_vt <= min_heap.vtime) {
-        bpf_spin_unlock(&heap_lock);
+
+    struct min_dsq_info min_heap;
+    pick_min_heap(&min_heap);
+    if (!min_heap.heap_info) {
+        return;
+    }
+
+    bpf_spin_lock(&min_heap.heap_info->heap_lock);
+
+    if (new_p_vt <= min_heap.vtime) {
+        bpf_spin_unlock(&min_heap.heap_info->heap_lock);
+        
         prev->scx.slice = MY_SLICE;
 
         u64 weighted_tick = (MY_SLICE / prev_gi->hweight);
@@ -740,28 +773,37 @@ void BPF_STRUCT_OPS(h_dispatch, s32 cpu, struct task_struct *prev)
         }
 
         // effectively we are doing a yield->enqueue->pick, print that explicitly for cmp with spec
-        if (want_to_print()) bpf_printk("re-running prev: vt=%llu, min_h=%d, curr_min=%llu", new_p_vt, min_heap.id,  min_heap.vtime);
+        if (want_to_print()) bpf_printk("re-running prev: vt=%llu, curr_min=%llu", new_p_vt, min_heap.vtime);
         if (want_to_print()) bpf_printk("(dispatch, using_prev)stopping: pid=%d, gid=%d, runnable=%d, time_used=%llu, grp_w=%lu, new_grp_vt=%llu", prev->pid, prev_gi->group_id, 1, prev_time_used, prev_gi->hweight, new_p_vt);
         if (want_to_print()) bpf_printk("(dispatch, using_prev)enqueue: pid=%d, gid=%d, flags=0, grp_w=%llu, new_nt=%d, new_grp_vt=%llu, p_vt=%llu", prev->pid, prev_gi->group_id, prev_gi->hweight, prev_gi->nthreads, new_grp_vt, new_p_vt);
         if (want_to_print()) bpf_printk("(dispatch, using_prev)running: pid=%d, gid=%d, ts=%llu, grp_w=%lu", prev->pid, prev_gi->group_id, prev_i->time_started_running, prev_gi->hweight);
 
-        bpf_cgroup_release(cgrp);
         return;
     }
 
-    s64 reserved_task_vtime = scx_bpf_dsq_reserve_head(dsq_id);
-
-    bpf_spin_unlock(&heap_lock);    
-    bpf_cgroup_release(cgrp);
-
+    s64 reserved_task_vtime = scx_bpf_dsq_reserve_head(min_heap.heap_info->heap_id);
+    bpf_spin_unlock(&min_heap.heap_info->heap_lock);
+    
     if (reserved_task_vtime != min_heap.vtime) {
         bpf_printk("race bug?? we held the lock the whole time though...");
     }
 
-    if (want_to_print()) bpf_printk("dispatch: cpu=%ld, prev=%d, pot_new_vt=%llu, curr_min=%llu, pulling_from_heap", cpu, prev->pid, new_p_vt, min_heap.vtime);
+    if (want_to_print()) bpf_printk("dispatch: cpu=%ld, prev=%d, pot_new_vt=%llu, curr_min=%llu, pulling_from_heap %d", cpu, prev->pid, new_p_vt, min_heap.vtime, min_heap.heap_info->heap_id);
 
-    scx_bpf_dsq_move_to_local(min_heap.id);
+    scx_bpf_dsq_move_to_local(min_heap.heap_info->heap_id);
     return;
+
+}
+
+
+void BPF_STRUCT_OPS(h_dispatch, s32 cpu, struct task_struct *prev)
+{
+    if (prev && (prev->scx.flags & SCX_TASK_QUEUED)) {
+        dispatch_w_prev(cpu, prev);
+    } else {
+        dispatch_no_prev(cpu);
+    }
+
 }
 
 void BPF_STRUCT_OPS(h_stopping, struct task_struct *p, bool runnable)
@@ -857,6 +899,11 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(h_init)
 {
     for (int i=0; i < NUM_HEAPS; i++) {
         scx_bpf_create_dsq(i, -1);
+        struct heap_info hi = { .heap_id = i };   // whatever defaults you want
+        int key = i;
+        if (bpf_map_update_elem(&heap_info_map, &key, &hi, BPF_ANY) < 0) {
+            return -ENOMEM;
+        }
     }
     return 0;
 }

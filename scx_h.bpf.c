@@ -476,6 +476,9 @@ s32 BPF_STRUCT_OPS(h_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_f
 
 void BPF_STRUCT_OPS(h_runnable, struct task_struct *p, u64 enq_flags)
 {
+    
+    if (want_to_print()) bpf_printk("call runnable on pid=%d", p->pid);
+
     struct cgroup_info *gi;
     struct cgroup *cgrp = scx_bpf_task_cgroup(p);
     
@@ -551,6 +554,8 @@ void BPF_STRUCT_OPS(h_runnable, struct task_struct *p, u64 enq_flags)
 
 void BPF_STRUCT_OPS(h_enqueue, struct task_struct *p, u64 enq_flags)
 {
+    if (want_to_print()) bpf_printk("call enqueue on pid=%d", p->pid);
+
     struct cgroup_info *gi;
     struct cgroup *cgrp = scx_bpf_task_cgroup(p);
     if (!cgrp) {
@@ -683,9 +688,14 @@ static void pick_min_heap(struct min_dsq_info *result) {
         
     int heap_to_start_from = bpf_get_prandom_u32() % NUM_HEAPS;
     int heap_id = heap_to_start_from;
+    int count_nonempty = 0;
     for (int count_tried = 0; count_tried < NUM_HEAPS; count_tried++) {
         heap_id = (heap_id + 1) % NUM_HEAPS;
+        if (count_nonempty == NUM_HEAPS_TO_SAMPLE) {
+            break;
+        }
         s64 heap_min = scx_bpf_dsq_peek_head_vtime(heap_id);
+        if (heap_min >= 0) count_nonempty ++;
         if (heap_min >= 0 && heap_min < curr_min_vt) {
             curr_min_heap = heap_id;
             curr_min_vt = heap_min;
@@ -697,20 +707,23 @@ static void pick_min_heap(struct min_dsq_info *result) {
 }
 
 
-static void dispatch_no_prev(s32 cpu)
+static void dispatch_no_prev(s32 cpu, u64 dispatch_start, u64 *time_to_pick_lock_heap, u64 *time_to_pull, u64 *n_iter_try)
 {
 
     struct core_info *ci = get_core_info(-1);
 
     struct min_dsq_info min_heap;
     bool found_heap = false;
+    int n_iter = 0;
     for (int i=0; i < 50; i++) {    
+        n_iter++;
         min_heap.heap_info = NULL; // reset
         pick_min_heap(&min_heap);
         if (!min_heap.heap_info) {
             // keep running prev
             break;
         }
+        *time_to_pick_lock_heap = bpf_ktime_get_ns() - dispatch_start; // can't do this inside the lock, so do it right before. If we fail to lock, we'll overwrite on the next iter
         bpf_spin_lock(&min_heap.heap_info->heap_lock);
         u64 locked_min = scx_bpf_dsq_peek_head_vtime(min_heap.heap_info->heap_id);
         if (locked_min < 0) locked_min = ~(0ULL);
@@ -721,6 +734,7 @@ static void dispatch_no_prev(s32 cpu)
             bpf_spin_unlock(&min_heap.heap_info->heap_lock);
         }
     }
+    *n_iter_try = n_iter;
     if (!found_heap) {
         if (want_to_print()) bpf_printk("dispatch (no prev) failed to find a min heap");
         if (ci) {
@@ -734,11 +748,13 @@ static void dispatch_no_prev(s32 cpu)
     bpf_spin_unlock(&min_heap.heap_info->heap_lock);
     scx_bpf_dsq_move_to_local(min_heap.heap_info->heap_id);
 
+    *time_to_pull = bpf_ktime_get_ns() - dispatch_start;
+
     if (want_to_print()) bpf_printk("dispatch: (no prev) locked and read from heap %d", min_heap.heap_info->heap_id);
 
 }
 
-static void dispatch_w_prev(s32 cpu, struct task_struct *prev)
+static void dispatch_w_prev(s32 cpu, struct task_struct *prev, u64 dispatch_start, u64 *time_to_get_sructs, u64 *time_to_pick_lock_heap, u64 *time_to_pull, u64 *n_iter_try)
 {
 
     if (!prev) {
@@ -760,6 +776,8 @@ static void dispatch_w_prev(s32 cpu, struct task_struct *prev)
 
     bpf_cgroup_release(cgrp);
 
+    *time_to_get_sructs = bpf_ktime_get_ns() - dispatch_start;
+
     // need to do this before locking (func calls not allowed during the lock)
     // only actually advance the time if the process is chosen to run next, otherwise "stopping" will do that for us
     u64 prev_time_used = (s64)bpf_ktime_get_ns() - (s64)prev_i->time_started_running;
@@ -768,13 +786,16 @@ static void dispatch_w_prev(s32 cpu, struct task_struct *prev)
 
     struct min_dsq_info min_heap;
     bool found_heap = false;
+    int n_iter = 0;
     for (int i=0; i < 50; i++) {    
+        n_iter++;
         min_heap.heap_info = NULL; // reset
         pick_min_heap(&min_heap);
         if (!min_heap.heap_info) {
             // keep running prev
             return;
         }
+        *time_to_pick_lock_heap = bpf_ktime_get_ns() - dispatch_start; // can't do this inside the lock, so do it right before. If we fail to lock, we'll overwrite on the next iter
         bpf_spin_lock(&min_heap.heap_info->heap_lock);
         u64 locked_min = scx_bpf_dsq_peek_head_vtime(min_heap.heap_info->heap_id);
         if (locked_min < 0) locked_min = ~(0ULL);
@@ -785,6 +806,7 @@ static void dispatch_w_prev(s32 cpu, struct task_struct *prev)
             bpf_spin_unlock(&min_heap.heap_info->heap_lock);
         }
     }
+    *n_iter_try = n_iter;
     if (!found_heap) {
         if (want_to_print()) bpf_printk("dispatch (prev) failed to find a min heap");
         return;
@@ -816,6 +838,8 @@ static void dispatch_w_prev(s32 cpu, struct task_struct *prev)
 
     scx_bpf_dsq_move_to_local(min_heap.heap_info->heap_id);
 
+    *time_to_pull = bpf_ktime_get_ns() - dispatch_start;
+
     if (want_to_print()) bpf_printk("dispatch: (prev) locked and reading heap %d, pulling from it", min_heap.heap_info->heap_id);
 
     return;
@@ -827,11 +851,13 @@ void BPF_STRUCT_OPS(h_dispatch, s32 cpu, struct task_struct *prev)
 {
     u64 dispatch_start = bpf_ktime_get_ns();
     if (prev && (prev->scx.flags & SCX_TASK_QUEUED)) {
-        dispatch_w_prev(cpu, prev);
-        // bpf_printk("dispatch took %llu ns", bpf_ktime_get_ns() - dispatch_start);
+        u64 time_to_get_sructs = 0, time_to_pick_lock_heap = 0, time_to_pull = 0, n_iter_try = 0;
+        dispatch_w_prev(cpu, prev, dispatch_start, &time_to_get_sructs, &time_to_pick_lock_heap, &time_to_pull, &n_iter_try);
+        // bpf_printk("dispatch took %llu ns; time_to_get_sructs=%llu, time_to_pick_lock_heap=%llu, time_to_pull=%llu, n_iter_try=%llu", bpf_ktime_get_ns() - dispatch_start, time_to_get_sructs, time_to_pick_lock_heap, time_to_pull, n_iter_try);
     } else {
-        dispatch_no_prev(cpu);
-        // bpf_printk("dispatch took %llu ns", bpf_ktime_get_ns() - dispatch_start);
+        u64 time_to_pick_lock_heap = 0, time_to_pull = 0, n_iter_try = 0;
+        dispatch_no_prev(cpu, dispatch_start, &time_to_pick_lock_heap, &time_to_pull, &n_iter_try);
+        // bpf_printk("dispatch took %llu ns; time_to_pick_lock_heap=%llu time_to_pull=%llu, n_iter_try=%llu", bpf_ktime_get_ns() - dispatch_start, time_to_pick_lock_heap, time_to_pull, n_iter_try);
     }
     
 
